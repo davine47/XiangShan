@@ -123,7 +123,7 @@ l1-test:
 	cd .. && mill XiangShan.test.testOnly -o -s cache.L1DTest.L1DCacheTest
 
 int-divider-test:
-	cd .. && mill XiangShan.test.testOnly -o -s futest.IntDividerTest
+	cd .. && mill xiangshan.test.testOnly -o -s futest.IntDividerTest
 
 unit-test-all:
 	cd .. && mill XiangShan.test.test -P$(P)
