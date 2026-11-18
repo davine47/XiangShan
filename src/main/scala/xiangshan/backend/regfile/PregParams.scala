@@ -1,20 +1,49 @@
 package xiangshan.backend.regfile
 
-import chisel3.util.log2Up
+import chisel3._
+import chisel3.util._
+import xiangshan.backend.BackendParams
 import xiangshan.backend.datapath.DataConfig._
 
 abstract class PregParams {
   val numEntries: Int
-  val numRead: Option[Int]
-  val numWrite: Option[Int]
-  val dataCfg: DataConfig
-  val isFake: Boolean
+  val numBank   : Int
+  val numRead   : Option[Int]
+  val numWrite  : Option[Int]
+  val dataCfg   : DataConfig
+  val isFake    : Boolean
 
   def addrWidth = log2Up(numEntries)
+  // addr for datas after read each bank
+  def bankRaddrWidth = log2Ceil(numBank)
+  // addr for read each bank
+  def arbiterAddrWidth = addrWidth - bankRaddrWidth
+
+  def bankIndex(addr: UInt): UInt = {
+    require(numBank > 0 && isPow2(numBank), s"numBank must be a positive power of two, but got $numBank")
+    if (numBank == 1) 0.U else addr(bankRaddrWidth - 1, 0)
+  }
+
+  def bankAddr(addr: UInt): UInt = {
+    require(numBank > 0 && isPow2(numBank), s"numBank must be a positive power of two, but got $numBank")
+    addr(addrWidth - 1, bankRaddrWidth)
+  }
+
+  def getNumWrite(backendParams: BackendParams): Int = {
+    this match {
+      case _: FpPregParams => backendParams.getFpRfWriteSize
+      case _: IntPregParams => backendParams.getIntRfWriteSize
+      case _: V0PregParams => backendParams.getV0RfWriteSize
+      case _: VfPregParams => backendParams.getVfRfWriteSize
+      case _: VlPregParams => backendParams.getVlRfWriteSize
+      case _ => throw new RuntimeException(s"the type[${this.getClass}] is not permitted to call getNumWrite method")
+    }
+  }
 }
 
 case class IntPregParams(
   numEntries: Int,
+  numBank   : Int,
   numRead   : Option[Int],
   numWrite  : Option[Int],
 ) extends PregParams {
@@ -25,6 +54,7 @@ case class IntPregParams(
 
 case class FpPregParams(
                           numEntries: Int,
+                          numBank   : Int,
                           numRead   : Option[Int],
                           numWrite  : Option[Int],
                         ) extends PregParams {
@@ -35,6 +65,7 @@ case class FpPregParams(
 
 case class VfPregParams(
   numEntries: Int,
+  numBank   : Int,
   numRead   : Option[Int],
   numWrite  : Option[Int],
 ) extends PregParams {
@@ -45,6 +76,7 @@ case class VfPregParams(
 
 case class V0PregParams(
   numEntries: Int,
+  numBank: Int,
   numRead   : Option[Int],
   numWrite  : Option[Int],
 ) extends PregParams {
@@ -55,6 +87,7 @@ case class V0PregParams(
 
 case class VlPregParams(
   numEntries: Int,
+  numBank   : Int,
   numRead   : Option[Int],
   numWrite  : Option[Int],
 ) extends PregParams {
@@ -65,6 +98,7 @@ case class VlPregParams(
 
 case class NoPregParams() extends PregParams {
   val numEntries: Int = 0
+  val numBank   : Int = 0
   val numRead   : Option[Int] = None
   val numWrite  : Option[Int] = None
 
@@ -74,6 +108,7 @@ case class NoPregParams() extends PregParams {
 
 case class FakeIntPregParams(
   numEntries: Int,
+  numBank   : Int,
   numRead   : Option[Int],
   numWrite  : Option[Int],
 ) extends PregParams {

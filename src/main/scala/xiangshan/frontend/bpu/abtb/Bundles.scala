@@ -18,10 +18,19 @@ package xiangshan.frontend.bpu.abtb
 import chisel3._
 import chisel3.util._
 import org.chipsalliance.cde.config.Parameters
-import xiangshan.frontend.PrunedAddr
+import xiangshan.XSCoreParamsKey
+import xiangshan.frontend.GuardedPc
 import xiangshan.frontend.bpu.BranchAttribute
+import xiangshan.frontend.bpu.Prediction
+import xiangshan.frontend.bpu.SaturateCounter
+import xiangshan.frontend.bpu.SaturateCounterFactory
 import xiangshan.frontend.bpu.TargetCarry
 import xiangshan.frontend.bpu.WriteReqBundle
+
+object TakenCounter extends SaturateCounterFactory {
+  def width(implicit p: Parameters): Int =
+    p(XSCoreParamsKey).frontendParameters.bpuParameters.abtbParameters.TakenCounterWidth
+}
 
 class BankReadReq(implicit p: Parameters) extends AheadBtbBundle {
   val setIdx: UInt = UInt(SetIdxWidth.W)
@@ -59,14 +68,18 @@ class ReplacerIO(implicit p: Parameters) extends AheadBtbBundle {
   val victimWayIdx:  UInt = Output(UInt(WayIdxWidth.W))
 }
 
+class AheadBtbMetaEntry(implicit p: Parameters) extends AheadBtbBundle {
+  val hit:             Bool            = Bool()
+  val attribute:       BranchAttribute = new BranchAttribute
+  val position:        UInt            = UInt(CfiPositionWidth.W)
+  val targetLowerBits: UInt            = UInt(TargetWidth.W)
+}
+
 class AheadBtbMeta(implicit p: Parameters) extends AheadBtbBundle {
-  val valid:           Bool                 = Bool()
-  val hitMask:         Vec[Bool]            = Vec(NumWays, Bool())
-  val attributes:      Vec[BranchAttribute] = Vec(NumWays, new BranchAttribute)
-  val positions:       Vec[UInt]            = Vec(NumWays, UInt(CfiPositionWidth.W))
-  val taken:           Bool                 = Bool()
-  val takenMaskOH:     Vec[Bool]            = Vec(NumWays, Bool())
-  val targetLowerBits: UInt                 = UInt(TargetLowerBitsWidth.W)
+  val valid:    Bool                   = Bool()
+  val setIdx:   UInt                   = UInt(SetIdxWidth.W)
+  val bankMask: UInt                   = UInt(NumBanks.W)
+  val entries:  Vec[AheadBtbMetaEntry] = Vec(NumWays, new AheadBtbMetaEntry())
 }
 
 class AheadBtbEntry(implicit p: Parameters) extends AheadBtbBundle {
@@ -74,7 +87,40 @@ class AheadBtbEntry(implicit p: Parameters) extends AheadBtbBundle {
   val tag:             UInt            = UInt(TagWidth.W)
   val position:        UInt            = UInt(CfiPositionWidth.W)
   val attribute:       BranchAttribute = new BranchAttribute
-  val targetLowerBits: UInt            = UInt(TargetLowerBitsWidth.W)
+  val targetLowerBits: UInt            = UInt(TargetWidth.W)
   // target fix, see comment in Parameters.scala
   val targetCarry: Option[TargetCarry] = if (EnableTargetFix) Option(new TargetCarry) else None
+}
+
+class PipelineState(implicit p: Parameters) extends AheadBtbBundle with Helpers {
+  val startPc:  GuardedPc            = GuardedPc()
+  val setIdx:   UInt                 = UInt(SetIdxWidth.W)
+  val bankIdx:  UInt                 = UInt(BankIdxWidth.W)
+  val bankMask: UInt                 = UInt(NumBanks.W)
+  val entries:  Vec[AheadBtbEntry]   = Vec(NumWays, new AheadBtbEntry)
+  val ctrVec:   Vec[SaturateCounter] = Vec(NumWays, TakenCounter())
+  val hitMask:  Vec[Bool]            = Vec(NumWays, Bool())
+
+  val debug_indexPc: Option[GuardedPc] = Option.when(!env.FPGAPlatform)(GuardedPc())
+
+  def getHitMask: Vec[Bool] =
+    VecInit(entries.map(e => e.valid && e.tag === getTag(startPc)))
+}
+
+class AheadBtbResult(implicit p: Parameters) extends AheadBtbBundle {
+  val entries:       Vec[Valid[Prediction]] = Vec(NumAheadBtbPredictionEntries, Valid(new Prediction))
+  val debug_startPc: Option[GuardedPc]      = Option.when(!env.FPGAPlatform)(GuardedPc())
+}
+
+class AheadBtbToMicroTageResult(implicit p: Parameters) extends AheadBtbBundle {
+  val taken:        Bool            = Bool()
+  val cfiPosition:  UInt            = UInt(CfiPositionWidth.W)
+  val attribute:    BranchAttribute = new BranchAttribute
+  val isStrongBias: Bool            = Bool()
+}
+
+class AheadBtbToMicroTageIO(implicit p: Parameters) extends AheadBtbBundle {
+  val result: Vec[Valid[AheadBtbToMicroTageResult]] =
+    Vec(NumAheadBtbPredictionEntries, Valid(new AheadBtbToMicroTageResult))
+  val fastPositions: Vec[UInt] = Vec(NumAheadBtbPredictionEntries, UInt(CfiPositionWidth.W))
 }

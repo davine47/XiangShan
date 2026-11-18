@@ -7,7 +7,7 @@ import utils.MapUtils
 import xiangshan._
 import xiangshan.backend.fu.FuType
 import xiangshan.backend.fu.vector.Utils
-import xiangshan.backend.issue.EntryBundles.RespType
+import xiangshan.backend.issue.EntryBundles.IssueQueueRespBundle
 
 class FuBusyTableWrite(fuLatencyMap: Map[FuType.OHType, Int]) (implicit p: Parameters, iqParams: IssueBlockParams) extends XSModule {
   private val latencyValMax: Int = fuLatencyMap.values.fold(0)(_ max _)
@@ -31,19 +31,19 @@ class FuBusyTableWrite(fuLatencyMap: Map[FuType.OHType, Int]) (implicit p: Param
   private val latMappedFuTypeSet: Map[Int, Set[FuType.OHType]] = MapUtils.groupByValueUnique(fuLatencyMap)
 
   private val deqRespSuccess = deqResp.valid
-  private val og0RespFail = og0Resp.valid
-  private val og1RespFail = og1Resp.valid && RespType.isBlocked(og1Resp.bits.resp)
+  private val og0RespFail = og0Resp.failed
+  private val og1RespFail = og1Resp.failed
 
-  private val deqRespMatchVec = getMatchVecFromResp(deqResp)
+  private val deqRespMatchVec = getMatchVecFromResp(deqResp.bits)
   private val og0RespMatchVec = getMatchVecFromResp(og0Resp)
   private val og1RespMatchVec = getMatchVecFromResp(og1Resp)
 
-  def getMatchVecFromResp(resp: Valid[IssueQueueDeqRespBundle]) : Vec[Bool] = {
+  def getMatchVecFromResp(resp: IssueQueueRespBundle) : Vec[Bool] = {
     VecInit((0 until tableSize).map {
       lat =>
         Cat(
           latMappedFuTypeSet.getOrElse(lat, Set()).toSeq.sorted.map(
-            fuType => resp.bits.fuType(fuType.id)
+            fuType => resp.fuType(fuType.id)
           ).toSeq
         ).orR
     })
@@ -63,9 +63,10 @@ class FuBusyTableWrite(fuLatencyMap: Map[FuType.OHType, Int]) (implicit p: Param
 class FuBusyTableWriteIO(latencyValMax: Int)(implicit p: Parameters, iqParams: IssueBlockParams) extends XSBundle {
   private val tableSize = latencyValMax + 1
   val in = new Bundle {
-    val deqResp =  Flipped(ValidIO(new IssueQueueDeqRespBundle))
-    val og0Resp = Flipped(ValidIO(new IssueQueueDeqRespBundle))
-    val og1Resp = Flipped(ValidIO(new IssueQueueDeqRespBundle))
+    // TODO: change deqResp logic
+    val deqResp =  Flipped(ValidIO(new IssueQueueRespBundle))
+    val og0Resp = Flipped(new IssueQueueRespBundle)
+    val og1Resp = Flipped(new IssueQueueRespBundle)
   }
   val out = new Bundle {
     val fuBusyTable = Output(UInt(tableSize.W))

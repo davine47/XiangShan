@@ -35,9 +35,6 @@ case class TLBParameters
   Replacer: Option[String] = Some("plru"),
   Associative: String = "fa", // must be fa
   outReplace: Boolean = false,
-  partialStaticPMP: Boolean = false, // partial static pmp result stored in entries
-  outsideRecvFlush: Boolean = false, // if outside moudle waiting for tlb recv flush pipe
-  saveLevel: Boolean = false,
   lgMaxSize: Int = 3
 )
 
@@ -62,6 +59,11 @@ case class L2TLBParameters
   l0nWays: Int = 4,
   l0ReservedBits: Int = 4,
   l0Replacer: Option[String] = Some("setplru"),
+  // bc (bitmapcache)
+  bcnSets: Int = 32,
+  bcnWays: Int = 4,
+  bcReservedBits: Int = 1,
+  bcReplacer: Option[String] = Some("setplru"),
   // sp
   spSize: Int = 16,
   spReplacer: Option[String] = Some("plru"),
@@ -87,9 +89,54 @@ case class L2TLBParameters
   enablePTWECC: Boolean = false
 )
 
+trait MPTCacheParam extends HasTlbConst {
+  val perms16Len = 48 // length of the perms
+  val mptSourceWidth = 4 // id len of the source
+  val mptLevelLenOH = 4 // level number 4 length in OH
+  val mptLevelLenUInt = 2 // level number 4 length in int
+  val mptOff = 16 // mpt offset of PA
+  val smmpt43PAddrBits = 43
+  val smmpt52PAddrBits = 52
+  // l3 8T
+  val l3Size  = 1
+  val mptL3TagLen = 5
+  val l3Associative = "fa"
+  val l3Replacer = "plru"
+  // l2 4G
+  val mptL2TagLen = mptL3TagLen + 9
+  val l2Size = 1
+  val l2Associative = "fa"
+  val l2Replacer = "plru"
+  // l1 32M
+  val l1Size = 4
+  val mptL1TagLen = mptL3TagLen + 9 * 2
+  val l1Associative = "fa"
+  val l1Replacer = "plru"
+  // l0 64k
+  val l0nSets = 32 // 5bits
+  val l0nWays = 4
+  val mptL0TagLen = mptL3TagLen + 9 * 3 - log2Up(l0nSets) // 32-5=27
+  val l0Replacer = "setplru"
+  // sp
+  val spSize = 8
+  val mptspTagLen = mptL3TagLen + 9 * 2
+  val spAssociative = "fa"
+  val spReplacer = "plru"
+
+
+  // get set num from pa def; just some wires, 0 delay
+
+  def geL0Set(ppn: UInt): UInt = {
+    require(log2Up(l0nWays) == log2Down(l0nWays), "ways must be scala.math.power of 2")
+    ppn(ppnLen - 1 - mptL0TagLen, ppnLen - mptL0TagLen - log2Up(l0nSets)) // (36-1-27,36-27-5)(8,4)
+  }
+
+  def switch0(switch: Bool, data: UInt, len: Int) = (Fill(len, switch) & data)
+}
 trait HasTlbConst extends HasXSParameter {
   val Level = if (EnableSv48) 3 else 2
 
+  val mptLevelLEN = 4 // HasMptCheck param
   val offLen  = 12
   val ppnLen  = PAddrBits - offLen
   val vpnnLen = 9
@@ -134,6 +181,16 @@ trait HasTlbConst extends HasXSParameter {
   def onlyStage1 = "b01".U
   def onlyStage2 = "b10".U
 
+  // Select translation stages from virtual mode and the VS/G-stage page-table modes
+  def getS2xlate(isVirt: Bool, vsatpMode: UInt, hgatpMode: UInt): UInt = {
+    MuxCase(noS2xlate, Seq(
+      !isVirt -> noS2xlate,
+      (vsatpMode =/= 0.U && hgatpMode =/= 0.U) -> allStage,
+      (vsatpMode === 0.U) -> onlyStage2,
+      (hgatpMode === 0.U) -> onlyStage1
+    ))
+  }
+
   def noSfence = "b00".U
   def isSfence = "b01".U
   def isVSfence = "b10".U
@@ -149,6 +206,13 @@ trait HasTlbConst extends HasXSParameter {
   def PMLEN16 = "b11".U
   def MaxMaskedWidth = 16
 
+  def mpt_merge_n(in1_level: UInt, in1_n: UInt, in2_level: UInt, in2_n: Bool): UInt = {
+    val in1_level_0 = (in1_level === 0.U)
+    val in2_level_0 = (in2_level === 0.U)
+    val merge = (in1_n.asBool && !in2_level_0) || (in2_n && !in1_level_0) || (in2_n && in1_n.asBool)
+    merge.asUInt
+  }
+
   def get_pn(addr: UInt) = {
     require(addr.getWidth > offLen)
     addr(addr.getWidth-1, offLen)
@@ -158,25 +222,18 @@ trait HasTlbConst extends HasXSParameter {
     addr(offLen-1, 0)
   }
 
+  def getVpnn(vpn: UInt, idx: UInt): UInt = {
+    MuxLookup(idx, 0.U)(Seq(
+      0.U -> vpn(vpnnLen - 1, 0),
+      1.U -> vpn(vpnnLen * 2 - 1, vpnnLen),
+      2.U -> vpn(vpnnLen * 3 - 1, vpnnLen * 2),
+      3.U -> vpn(vpnnLen * 4 - 1, vpnnLen * 3))
+    )
+  }
+
   def get_set_idx(vpn: UInt, nSets: Int): UInt = {
     require(nSets >= 1)
     vpn(log2Up(nSets)-1, 0)
-  }
-
-  def drop_set_idx(vpn: UInt, nSets: Int): UInt = {
-    require(nSets >= 1)
-    require(vpn.getWidth > log2Ceil(nSets))
-    vpn(vpn.getWidth-1, log2Ceil(nSets))
-  }
-
-  def drop_set_equal(vpn1: UInt, vpn2: UInt, nSets: Int): Bool = {
-    require(nSets >= 1)
-    require(vpn1.getWidth == vpn2.getWidth)
-    if (vpn1.getWidth <= log2Ceil(nSets)) {
-      true.B
-    } else {
-      drop_set_idx(vpn1, nSets) === drop_set_idx(vpn2, nSets)
-    }
   }
 
   def replaceWrapper(v: UInt, lruIdx: UInt): UInt = {
@@ -193,35 +250,11 @@ trait HasTlbConst extends HasXSParameter {
   import scala.language.implicitConversions
 
   implicit def hptwresp_to_tlbperm(hptwResp: HptwResp): TlbPermBundle = {
-    val tp = Wire(new TlbPermBundle)
-    val ptePerm = hptwResp.entry.perm.get.asTypeOf(new PtePermBundle().cloneType)
-    tp.pf := hptwResp.gpf
-    tp.af := hptwResp.gaf
-    tp.v := DontCare
-    tp.d := ptePerm.d
-    tp.a := ptePerm.a
-    tp.g := ptePerm.g
-    tp.u := ptePerm.u
-    tp.x := ptePerm.x
-    tp.w := ptePerm.w
-    tp.r := ptePerm.r
-    tp
+    Wire(new TlbPermBundle(hasV = false)).applyS2(hptwResp)
   }
 
   implicit def ptwresp_to_tlbperm(ptwResp: PtwSectorResp): TlbPermBundle = {
-    val tp = Wire(new TlbPermBundle)
-    val ptePerm = ptwResp.entry.perm.get.asTypeOf(new PtePermBundle().cloneType)
-    tp.pf := ptwResp.pf
-    tp.af := ptwResp.af
-    tp.v := ptwResp.entry.v
-    tp.d := ptePerm.d
-    tp.a := ptePerm.a
-    tp.g := ptePerm.g
-    tp.u := ptePerm.u
-    tp.x := ptePerm.x
-    tp.w := ptePerm.w
-    tp.r := ptePerm.r
-    tp
+    Wire(new TlbPermBundle()).apply(ptwResp)
   }
 }
 
@@ -264,7 +297,10 @@ trait HasPtwConst extends HasTlbConst with MemoryOpConstants{
 
   // miss queue
   val MissQueueSize = l2tlbParams.ifilterSize + l2tlbParams.dfilterSize
-  val MemReqWidth = if (HasBitmapCheck) 2 *(l2tlbParams.llptwsize + 1 + 1) else (l2tlbParams.llptwsize + 1 + 1)
+  val MemReqWidth = if (HasBitmapCheck) 2 * (l2tlbParams.llptwsize + 1 + 1) else if (HasMptCheck) ((l2tlbParams.llptwsize + 3))
+  else (l2tlbParams.llptwsize + 1 + 1)
+
+  val mptcMemReqID = l2tlbParams.llptwsize + 2
   val HptwReqId = l2tlbParams.llptwsize + 1
   val FsmReqID = l2tlbParams.llptwsize
   val bMemID = log2Up(MemReqWidth)
@@ -316,20 +352,11 @@ trait HasPtwConst extends HasTlbConst with MemoryOpConstants{
 
   def MakeGPAddr(ppn: UInt, off: UInt) = {
     require(off.getWidth == 9 || off.getWidth == 11)
-    (Cat(ppn, 0.U(offLen.W)) + Cat(off, 0.U(log2Up(XLEN / 8).W)))(GPAddrBits - 1, 0)
+    (Cat(ppn, 0.U(offLen.W)) | Cat(off, 0.U(log2Up(XLEN / 8).W)))(GPAddrBits - 1, 0)
   }
 
   def getVpnn(vpn: UInt, idx: Int): UInt = {
     vpn(vpnnLen*(idx+1)-1, vpnnLen*idx)
-  }
-
-  def getVpnn(vpn: UInt, idx: UInt): UInt = {
-    MuxLookup(idx, 0.U)(Seq(
-      0.U -> vpn(vpnnLen - 1, 0),
-      1.U -> vpn(vpnnLen * 2 - 1, vpnnLen),
-      2.U -> vpn(vpnnLen * 3 - 1, vpnnLen * 2),
-      3.U -> vpn(vpnnLen * 4 - 1, vpnnLen * 3))
-    )
   }
 
   def getGVpnn(vpn: UInt, idx: UInt, mode: UInt): UInt = {

@@ -28,6 +28,7 @@ case class FrontendParameters(
     FetchBlockSize:           Int = 64, // bytes
     FetchPorts:               Int = 2,  // 2-fetch
     ResolveEntryBranchNumber: Int = 8,
+    PrefetchDepth:            Int = 32, // maximum icache prefetch / bpu runahead depth
     bpuParameters:            BpuParameters = BpuParameters(),
     ftqParameters:            FtqParameters = FtqParameters(),
     icacheParameters:         ICacheParameters = ICacheParameters(),
@@ -58,10 +59,20 @@ case class FrontendParameters(
 
   // sanity check
   require(isPow2(FetchBlockSize))
+  require(FetchPorts == 1 || FetchPorts == 2, "Only 1 or 2-fetch is supported")
 }
 
 trait HasFrontendParameters extends HasXSParameter {
   def frontendParameters: FrontendParameters = coreParams.frontendParameters
+
+  // frontend-backend/memblock port delays
+  // these are highly coupled with pipeline design, so it's not parameterized for now
+  // we define them as constants here for better code readability, change with caution
+  def TlbCsrPortDelay:  Int = 1
+  def CsrCtrlPortDelay: Int = 2
+  def SfencePortDelay:  Int = 2
+  def WfiReqPortDelay:  Int = 1
+  def WfiSafePortDealy: Int = 1
 
   def FetchPorts: Int = frontendParameters.FetchPorts
 
@@ -69,6 +80,8 @@ trait HasFrontendParameters extends HasXSParameter {
   def FetchBlockInstNum: Int = FetchBlockSize / instBytes
 //  def FetchBlockInstOffsetWidth = log2Ceil(FetchBlockInstNum) inherited from HasXSParameter
   def CfiPositionWidth: Int = log2Ceil(FetchBlockInstNum) // 2/4B(inst) aligned
+
+  def PrefetchDepth: Int = frontendParameters.PrefetchDepth
 
   // shared by Ifu and IBuffer
   // NOTE: we can enqueue FetchBlockInstNum instructions from Ifu,
@@ -78,4 +91,9 @@ trait HasFrontendParameters extends HasXSParameter {
   def IBufferEnqueueWidth: Int = FetchBlockInstNum + frontendParameters.ibufferParameters.NumWriteBank
 
   def ResolveEntryBranchNumber: Int = frontendParameters.ResolveEntryBranchNumber
+
+  def MaxPrefetchReqNum: Int = 2
+  def MaxFetchReqNum:    Int = 2
+  def MaxAccessLineNum:  Int = 2
+  def MaxFetchLineNum:   Int = MaxFetchReqNum * MaxAccessLineNum
 }

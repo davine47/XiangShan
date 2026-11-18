@@ -17,16 +17,28 @@ package xiangshan.frontend.bpu.ubtb
 
 import chisel3._
 import chisel3.util._
+import utils.AddrField
 import xiangshan.frontend.PrunedAddr
 import xiangshan.frontend.bpu.TargetFixHelper
 
 trait Helpers extends HasMicroBtbParameters with TargetFixHelper {
-  def getTag(vAddr: PrunedAddr): UInt =
-    vAddr(TagWidth + instOffsetBits - 1, instOffsetBits)
+  val addrFields = AddrField(
+    Seq(
+      ("instOffset", instOffsetBits),
+      ("tag", TagWidth)
+    ),
+    maxWidth = Option(VAddrBits),
+    extraFields = Seq(
+      ("targetLower", instOffsetBits, TargetWidth)
+    )
+  )
 
-  def getTargetUpper(vAddr: PrunedAddr): UInt =
-    vAddr(VAddrBits - 1, TargetWidth + instOffsetBits)
+  def getTag(pc: PrunedAddr): UInt =
+    addrFields.extract("tag", pc)
+
+  def getTargetUpper(pc: PrunedAddr): UInt =
+    pc(pc.length - 1, addrFields.getEnd("targetLower") + 1)
 
   def getEntryTarget(fullTarget: PrunedAddr): UInt =
-    fullTarget(TargetWidth + instOffsetBits - 1, instOffsetBits)
+    addrFields.extract("targetLower", fullTarget)
 }

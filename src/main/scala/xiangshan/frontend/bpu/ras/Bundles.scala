@@ -21,16 +21,16 @@ import org.chipsalliance.cde.config.Parameters
 import utility.CircularQueuePtr
 import xiangshan.RedirectLevel
 import xiangshan.XSCoreParamsKey
-import xiangshan.frontend.PrunedAddr
+import xiangshan.frontend.GuardedPc
 import xiangshan.frontend.bpu.BranchAttribute
 
 class RasEntry(implicit p: Parameters) extends RasBundle {
-  val retAddr: PrunedAddr = PrunedAddr(VAddrBits)
-  val ctr:     UInt       = UInt(StackCounterWidth.W) // layer of nested call functions
+  val retAddr: GuardedPc = GuardedPc()
+  val ctr:     UInt      = UInt(StackCounterWidth.W) // layer of nested call functions
 }
 
 object RasEntry {
-  def apply(retAddr: PrunedAddr, ctr: UInt)(implicit p: Parameters): RasEntry = {
+  def apply(retAddr: GuardedPc, ctr: UInt)(implicit p: Parameters): RasEntry = {
     val e = Wire(new RasEntry)
     e.retAddr := retAddr
     e.ctr     := ctr
@@ -73,14 +73,18 @@ object RasInternalMeta {
   }
 }
 
-class RasMeta(implicit p: Parameters) extends RasBundle {
+class RasRedirectMeta(implicit p: Parameters) extends RasInternalMeta {
+  val topRetAddr: GuardedPc = GuardedPc()
+}
+
+class RasCommitMeta(implicit p: Parameters) extends RasBundle {
   val ssp:  UInt   = UInt(log2Up(CommitStackSize).W)
   val tosw: RasPtr = new RasPtr
 }
 
-object RasMeta {
-  def apply(ssp: UInt, tosw: RasPtr)(implicit p: Parameters): RasMeta = {
-    val e = Wire(new RasMeta)
+object RasCommitMeta {
+  def apply(ssp: UInt, tosw: RasPtr)(implicit p: Parameters): RasCommitMeta = {
+    val e = Wire(new RasCommitMeta)
     e.ssp  := ssp
     e.tosw := tosw
     e
@@ -103,19 +107,5 @@ class RasBypass(implicit p: Parameters) extends RasBundle {
 class RasSpecInfo(implicit p: Parameters) extends RasBundle {
   val attribute:   BranchAttribute = new BranchAttribute
   val cfiPosition: UInt            = UInt(CfiPositionWidth.W)
-  val startPc:     UInt            = UInt(VAddrBits.W)
-  val isRvc:       Bool            = Bool()
-}
-
-class RasCommitInfo(implicit p: Parameters) extends RasBundle {
-  val attribute: BranchAttribute = new BranchAttribute
-  val meta:      RasMeta         = new RasMeta
-}
-
-class RasRedirectInfo(implicit p: Parameters) extends RasBundle {
-  val attribute: BranchAttribute = new BranchAttribute
-  val brPc:      PrunedAddr      = PrunedAddr(VAddrBits)
-  val isRvc:     Bool            = Bool()
-  val meta:      RasInternalMeta = new RasInternalMeta
-  val level:     UInt            = RedirectLevel()
+  val startPc:     UInt            = UInt(GuardedVAddrBits.W)
 }

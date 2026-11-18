@@ -18,19 +18,24 @@ package xiangshan.frontend.bpu
 import chisel3._
 import chisel3.util._
 import org.chipsalliance.cde.config.Parameters
+import utils.Duplicate
 import utils.EnumUInt
+import xiangshan.Resolve
 import xiangshan.backend.decode.isa.predecode.PreDecodeInst
-import xiangshan.frontend.PrunedAddr
+import xiangshan.frontend.GuardedPc
+import xiangshan.frontend.Pc
 import xiangshan.frontend.bpu.abtb.AheadBtbMeta
-import xiangshan.frontend.bpu.history.ghr.GhrMeta
+import xiangshan.frontend.bpu.history.commonhr.CommonHRMeta
+import xiangshan.frontend.bpu.history.commonhr.CommonHRResolveMeta
 import xiangshan.frontend.bpu.history.phr.PhrMeta
 import xiangshan.frontend.bpu.ittage.IttageMeta
 import xiangshan.frontend.bpu.mbtb.MainBtbMeta
-import xiangshan.frontend.bpu.ras.RasInternalMeta
-import xiangshan.frontend.bpu.ras.RasMeta
+import xiangshan.frontend.bpu.ras.RasCommitMeta
+import xiangshan.frontend.bpu.ras.RasRedirectMeta
 import xiangshan.frontend.bpu.sc.ScMeta
 import xiangshan.frontend.bpu.tage.TageMeta
 import xiangshan.frontend.bpu.utage.MicroTageMeta
+import xiangshan.frontend.ftq.ResolveSource
 
 /* *** public const & type *** */
 class BranchAttribute extends Bundle {
@@ -42,8 +47,7 @@ class BranchAttribute extends Bundle {
   def isDirect:      Bool = branchType === BranchAttribute.BranchType.Direct
   def isIndirect:    Bool = branchType === BranchAttribute.BranchType.Indirect
 
-  def isOtherIndirect: Bool =
-    branchType === BranchAttribute.BranchType.Indirect && rasAction === BranchAttribute.RasAction.None
+  def isOtherIndirect: Bool = isIndirect && rasAction === BranchAttribute.RasAction.None
 
   // NOTE: maybe we should check branchType === BranchAttribute.BranchType.Direct/Indirect,
   //       but as BranchAttribute.BranchType is declared as private,
@@ -56,6 +60,11 @@ class BranchAttribute extends Bundle {
   // hasPop = isPop || isPushAndPop, hasPush = isPush || isPushAndPop
   def hasPop:  Bool = rasAction(BranchAttribute.RasAction.popBit)
   def hasPush: Bool = rasAction(BranchAttribute.RasAction.pushBit)
+
+  def needIttage: Bool = isIndirect && !hasPop
+
+  def =/=(that: BranchAttribute): Bool =
+    this.branchType =/= that.branchType || this.rasAction =/= that.rasAction
 }
 
 object BranchAttribute {
@@ -139,33 +148,50 @@ object BranchAttribute {
 
 class BpuPredictionSource extends Bundle {
   val s1Source:   UInt = BpuPredictionSource.Stage1()
+  val s2Source:   UInt = BpuPredictionSource.Stage2()
   val s3Source:   UInt = BpuPredictionSource.Stage3()
+  val s2Override: Bool = Bool()
   val s3Override: Bool = Bool()
 
-  def s1Ubtb:            Bool = s1Source === BpuPredictionSource.Stage1.Ubtb
-  def s1Abtb:            Bool = s1Source === BpuPredictionSource.Stage1.Abtb
-  def s1Fallthrough:     Bool = s1Source === BpuPredictionSource.Stage1.Fallthrough
-  def s3Ras:             Bool = s3Source === BpuPredictionSource.Stage3.Ras
-  def s3ITTage:          Bool = s3Source === BpuPredictionSource.Stage3.ITTage
-  def s3MbtbTage:        Bool = s3Source === BpuPredictionSource.Stage3.MbtbTage
-  def s3Mbtb:            Bool = s3Source === BpuPredictionSource.Stage3.Mbtb
-  def s3FallthroughTage: Bool = s3Source === BpuPredictionSource.Stage3.FallthroughTage
-  def s3Fallthrough:     Bool = s3Source === BpuPredictionSource.Stage3.Fallthrough
+  def s1Ubtb:        Bool = s1Source === BpuPredictionSource.Stage1.Ubtb
+  def s1Abtb:        Bool = s1Source === BpuPredictionSource.Stage1.Abtb
+  def s1Fallthrough: Bool = s1Source === BpuPredictionSource.Stage1.Fallthrough
+  def s1UbtbUras:    Bool = s1Source === BpuPredictionSource.Stage1.UbtbUras
+  def s1AbtbUras:    Bool = s1Source === BpuPredictionSource.Stage1.AbtbUras
+  def s2Tage:        Bool = s2Source === BpuPredictionSource.Stage2.Tage
+  def s2Mbtb:        Bool = s2Source === BpuPredictionSource.Stage2.Mbtb
+  def s2Fallthrough: Bool = s2Source === BpuPredictionSource.Stage2.Fallthrough
+  def s3Ras:         Bool = s3Source === BpuPredictionSource.Stage3.Ras
+  def s3ITTage:      Bool = s3Source === BpuPredictionSource.Stage3.ITTage
+  def s3Sc:          Bool = s3Source === BpuPredictionSource.Stage3.Sc
+  def s3Tage:        Bool = s3Source === BpuPredictionSource.Stage3.Tage
+  def s3Mbtb:        Bool = s3Source === BpuPredictionSource.Stage3.Mbtb
+  def s3Fallthrough: Bool = s3Source === BpuPredictionSource.Stage3.Fallthrough
 }
 
 object BpuPredictionSource {
-  object Stage1 extends EnumUInt(3) {
+  object Stage1 extends EnumUInt(7) {
     def Ubtb:        UInt = 0.U(width.W)
     def Abtb:        UInt = 1.U(width.W)
+    def UbtbUtage:   UInt = 2.U(width.W) // now utage must work with abtb, so this is unused and reserved
+    def AbtbUtage:   UInt = 3.U(width.W)
+    def Fallthrough: UInt = 4.U(width.W)
+    // The BTB supplies the branch; micro-RAS supplies its return target.
+    def UbtbUras: UInt = 5.U(width.W)
+    def AbtbUras: UInt = 6.U(width.W)
+  }
+  object Stage2 extends EnumUInt(3) {
+    def Tage:        UInt = 0.U(width.W)
+    def Mbtb:        UInt = 1.U(width.W)
     def Fallthrough: UInt = 2.U(width.W)
   }
   object Stage3 extends EnumUInt(6) {
-    def Ras:             UInt = 0.U(width.W)
-    def ITTage:          UInt = 1.U(width.W)
-    def MbtbTage:        UInt = 2.U(width.W)
-    def Mbtb:            UInt = 3.U(width.W)
-    def FallthroughTage: UInt = 4.U(width.W)
-    def Fallthrough:     UInt = 5.U(width.W)
+    def Ras:         UInt = 0.U(width.W)
+    def ITTage:      UInt = 1.U(width.W)
+    def Sc:          UInt = 2.U(width.W)
+    def Tage:        UInt = 3.U(width.W)
+    def Mbtb:        UInt = 4.U(width.W)
+    def Fallthrough: UInt = 5.U(width.W)
   }
 }
 
@@ -175,6 +201,7 @@ class BpuCtrl extends Bundle {
   // s1 predictor enable
   val ubtbEnable: Bool = Bool()
   val abtbEnable: Bool = Bool()
+  // val utageEnable: Bool = Bool()
   // s3 predictor enable
   val mbtbEnable:   Bool = Bool()
   val tageEnable:   Bool = Bool()
@@ -182,99 +209,172 @@ class BpuCtrl extends Bundle {
   val ittageEnable: Bool = Bool()
   val rasEnable:    Bool = Bool()
 }
+// for constantin
+class BpuConstCtrl extends Bundle {
+  val use:  Bool    = Bool()
+  val ctrl: BpuCtrl = new BpuCtrl
+}
 
 // Bpu -> Ftq
-class BpuPrediction(implicit p: Parameters) extends BpuBundle with HalfAlignHelper {
-  val startVAddr:     PrunedAddr  = PrunedAddr(VAddrBits)
-  val target:         PrunedAddr  = PrunedAddr(VAddrBits)
-  val takenCfiOffset: Valid[UInt] = Valid(UInt(CfiPositionWidth.W))
+class BpuPrediction(implicit p: Parameters) extends BpuBundle {
+  val startPc:     GuardedPc = GuardedPc()
+  val target:      GuardedPc = GuardedPc()
+  val taken:       Bool      = Bool()
+  val endPosition: UInt      = UInt(CfiPositionWidth.W)
   // override valid
+  val s2Override: Bool = Bool()
   val s3Override: Bool = Bool()
 
-  def fromStage(pc: PrunedAddr, prediction: Prediction): Unit = {
-    this.startVAddr           := pc
-    this.takenCfiOffset.valid := prediction.taken
-    this.takenCfiOffset.bits  := getFtqOffset(pc, prediction.cfiPosition)
-    this.target               := prediction.target
+  def fromStage(startPc: GuardedPc, prediction: Prediction): Unit = {
+    this.startPc     := startPc
+    this.target      := prediction.target
+    this.taken       := prediction.taken
+    this.endPosition := prediction.cfiPosition
   }
-  // TODO: what else do we need?
 }
 
 // Backend & Ftq -> Bpu
 class BpuRedirect(implicit p: Parameters) extends BpuBundle {
-  val startVAddr:      PrunedAddr         = PrunedAddr(VAddrBits)
-  val target:          PrunedAddr         = PrunedAddr(VAddrBits)
-  val isRvc:           Bool               = Bool()
-  val taken:           Bool               = Bool()
-  val speculationMeta: BpuSpeculationMeta = new BpuSpeculationMeta
-  val attribute:       BranchAttribute    = new BranchAttribute
+  // BpuRedirect need the virtual address of the control flow instruction (cfiPc) instead of startPc in other bundles
+  val cfiPc:     GuardedPc       = GuardedPc()
+  val target:    GuardedPc       = GuardedPc()
+  val taken:     Bool            = Bool()
+  val attribute: BranchAttribute = new BranchAttribute
+  val meta:      BpuRedirectMeta = new BpuRedirectMeta
 }
 
-class BranchInfo(implicit p: Parameters) extends BpuBundle {
-  val target:      PrunedAddr      = PrunedAddr(VAddrBits)
+class BranchInfo(implicit p: Parameters) extends BpuBundle with HalfAlignHelper {
+  val target:      Pc              = Pc()
   val taken:       Bool            = Bool()
   val cfiPosition: UInt            = UInt(CfiPositionWidth.W)
   val attribute:   BranchAttribute = new BranchAttribute
   val mispredict:  Bool            = Bool()
+
+  val debug_realCfiPc: Option[UInt] = Option.when(!env.FPGAPlatform)(UInt(VAddrBits.W))
+
+  // backend resolve train s1/s3 predictor
+  def fromResolve(resolve: Resolve): Unit = {
+    this.taken       := resolve.taken
+    this.target      := resolve.target
+    this.cfiPosition := getAlignedPosition(resolve.pc, resolve.ftqOffset)._1
+    this.attribute   := resolve.attribute
+    this.mispredict  := resolve.mispredict
+
+    if (!env.FPGAPlatform) {
+      this.debug_realCfiPc.get := getRealCfiPcFromOffset(
+        resolve.pc,
+        resolve.ftqOffset,
+        resolve.debug_isRVC.get
+      )
+    }
+  }
+
+  // s3 prediction train s1 predictor
+  def fromPrediction(prediction: Prediction, hasOverride: Bool): Unit = {
+    this.taken       := prediction.taken
+    this.target      := prediction.target.unGuard // s1 training does not need guard bit
+    this.cfiPosition := prediction.cfiPosition
+    this.attribute   := prediction.attribute
+    this.mispredict  := hasOverride
+    // not available
+    this.debug_realCfiPc.foreach(_ := DontCare)
+  }
 }
 
 // Backend & Ftq -> Bpu
 class BpuTrain(implicit p: Parameters) extends BpuBundle with HalfAlignHelper {
-  val meta:       BpuMeta                = new BpuMeta
-  val startVAddr: PrunedAddr             = PrunedAddr(VAddrBits)
-  val branches:   Vec[Valid[BranchInfo]] = Vec(ResolveEntryBranchNumber, Valid(new BranchInfo))
+  val startPcVec: Duplicate[Vec[Pc]] =
+    Duplicate(NumStartPcDuplicate, Vec(NumBtbAlignBanks, Pc()))
+  val branches: Vec[Valid[BranchInfo]] = Vec(ResolveEntryBranchNumber, Valid(new BranchInfo))
+  val meta:     BpuResolveMeta         = new BpuResolveMeta
+  val perfMeta: BpuPerfMeta            = new BpuPerfMeta
 
-  // we masked out all branches after the first mispredict branch in Bpu top (refer to Bpu.scala t0_firstMispredictMask)
-  // so, we can assert that branches.map(b => b.valid && b.bits.mispredict) is at-most-one-hot
-  // NOTE: do not use this on Bpu.io.fromFtq.train, it does not ensure the above assertion
+  val debug_source: UInt = ResolveSource()
+
+  def startPc: Pc = startPcVec.get.head // get one duplicate and use its head (startPc for first alignBank)
+
+  // FTQ masks out all branches after the first mispredicted branch before sending training to BPU,
+  // so branches.map(b => b.valid && b.bits.mispredict) is at-most-one-hot.
   def mispredictBranch: Valid[BranchInfo] =
     Mux1H(branches.map(b => (b.valid && b.bits.mispredict, b)))
 }
 
+// Bpu top -> predictors
+class Train(NumStartPcVecDup: Int = 1)(implicit p: Parameters) extends BpuTrain {
+  override val startPcVec: Duplicate[Vec[Pc]] =
+    Duplicate(NumStartPcVecDup, Vec(NumBtbAlignBanks, Pc()))
+
+  def fromBpuTrain(that: BpuTrain): Unit = {
+    this.startPcVec := that.startPcVec // NOTE this ':=' is overloaded for fan-out balancing
+    this.branches   := that.branches
+    this.meta       := that.meta
+    this.perfMeta   := that.perfMeta
+
+    this.debug_source := that.debug_source
+  }
+}
+
 // use s3 prediction to train s1 predictors
-class BpuFastTrain(implicit p: Parameters) extends BpuBundle {
-  val startVAddr:      PrunedAddr    = PrunedAddr(VAddrBits)
-  val finalPrediction: Prediction    = new Prediction
-  val hasOverride:     Bool          = Bool()
-  val abtbMeta:        AheadBtbMeta  = new AheadBtbMeta
-  val utageMeta:       MicroTageMeta = new MicroTageMeta
+class FastTrain(implicit p: Parameters) extends BpuBundle {
+  val startPc:   Pc            = Pc()
+  val branch:    BranchInfo    = new BranchInfo
+  val abtbMeta:  AheadBtbMeta  = new AheadBtbMeta
+  val utageMeta: MicroTageMeta = new MicroTageMeta
+}
+
+// metadata for commit training (e.g. ras)
+class BpuCommitMeta(implicit p: Parameters) extends BpuBundle {
+  val ras:       RasCommitMeta   = new RasCommitMeta
+  val attribute: BranchAttribute = new BranchAttribute
 }
 
 class BpuCommit(implicit p: Parameters) extends BpuBundle with HalfAlignHelper {
-  val rasMeta:   RasMeta         = new RasMeta
-  val attribute: BranchAttribute = new BranchAttribute
-  // TODO: and maybe more
+  val meta: BpuCommitMeta = new BpuCommitMeta
 }
 
 // metadata for redirect (e.g. speculative state recovery) & training (e.g. rasPtr, phr)
-class BpuSpeculationMeta(implicit p: Parameters) extends BpuBundle {
-  val phrMeta:    PhrMeta         = new PhrMeta
-  val ghrMeta:    GhrMeta         = new GhrMeta
-  val rasMeta:    RasInternalMeta = new RasInternalMeta
-  val topRetAddr: PrunedAddr      = PrunedAddr(VAddrBits)
-  // TODO: rasPtr for recovery
-  // TODO: and maybe more
+class BpuRedirectMeta(implicit p: Parameters) extends BpuBundle {
+  val phr:          PhrMeta         = new PhrMeta
+  val commonHRMeta: CommonHRMeta    = new CommonHRMeta
+  val ras:          RasRedirectMeta = new RasRedirectMeta
 }
 
-// metadata for training (e.g. aheadBtb, mainBtb-specific)
-class BpuMeta(implicit p: Parameters) extends BpuBundle {
-  val utage:  MicroTageMeta = new MicroTageMeta
-  val mbtb:   MainBtbMeta   = new MainBtbMeta
-  val tage:   TageMeta      = new TageMeta
-  val ras:    RasMeta       = new RasMeta
-  val phr:    PhrMeta       = new PhrMeta
-  val sc:     ScMeta        = new ScMeta
-  val ittage: IttageMeta    = new IttageMeta
+// metadata for resolve training (e.g. tage, mainBtb)
+class BpuResolveMeta(implicit p: Parameters) extends BpuBundle {
+  val mbtb:     MainBtbMeta         = new MainBtbMeta
+  val tage:     TageMeta            = new TageMeta
+  val sc:       ScMeta              = new ScMeta
+  val ittage:   IttageMeta          = new IttageMeta
+  val phr:      PhrMeta             = new PhrMeta
+  val commonHR: CommonHRResolveMeta = new CommonHRResolveMeta
+
+  // val debug_utage: Option[MicroTageMeta] = Option.when(!env.FPGAPlatform)(new MicroTageMeta)
+  val utage: MicroTageMeta = new MicroTageMeta
 }
 
 class BpuPerfMeta(implicit p: Parameters) extends BpuBundle {
   val bpId:         UInt                = UInt(XLEN.W)
-  val startVAddr:   PrunedAddr          = new PrunedAddr(VAddrBits)
+  val scUsed:       UInt                = UInt(NumBtbResultEntries.W)
+  val startPc:      Pc                  = new Pc
   val s1Prediction: Prediction          = new Prediction
+  val s2Prediction: Prediction          = new Prediction
   val s3Prediction: Prediction          = new Prediction
+  val mbtbMeta:     MainBtbMeta         = new MainBtbMeta
   val bpSource:     BpuPredictionSource = new BpuPredictionSource
 
-  def bpPred: Prediction = Mux(bpSource.s3Override, s3Prediction, s1Prediction)
+  def bpPred: Prediction = MuxCase(
+    s1Prediction,
+    Seq(
+      bpSource.s3Override -> s3Prediction,
+      bpSource.s2Override -> s2Prediction
+    )
+  )
+}
+
+class BpuMeta(implicit p: Parameters) extends BpuBundle {
+  val redirectMeta: BpuRedirectMeta = new BpuRedirectMeta
+  val resolveMeta:  BpuResolveMeta  = new BpuResolveMeta
+  val commitMeta:   BpuCommitMeta   = new BpuCommitMeta
 }
 
 /* *** internal const & type *** */
@@ -316,21 +416,16 @@ class StageCtrl(implicit p: Parameters) extends BpuBundle {
   val s1_fire: Bool = Bool()
   val s2_fire: Bool = Bool()
   val s3_fire: Bool = Bool()
+
+  val t0_fire: Bool = Bool()
 }
 
 // sub predictors -> Bpu top
-class BtbInfo(implicit p: Parameters) extends BpuBundle {
+class Prediction(implicit p: Parameters) extends BpuBundle {
   val cfiPosition: UInt            = UInt(CfiPositionWidth.W)
-  val target:      PrunedAddr      = PrunedAddr(VAddrBits)
+  val target:      GuardedPc       = GuardedPc()
   val attribute:   BranchAttribute = new BranchAttribute
-}
+  val taken:       Bool            = Bool()
 
-class Prediction(implicit p: Parameters) extends BtbInfo {
-  val taken: Bool = Bool()
-
-  def isIdentical(other: Prediction): Bool =
-    this.taken === other.taken &&
-      this.cfiPosition === other.cfiPosition &&
-      this.target === other.target &&
-      this.attribute === other.attribute
+  def targetLower: UInt = target(MaxBtbTargetWidth + instOffsetBits - 1, instOffsetBits)
 }

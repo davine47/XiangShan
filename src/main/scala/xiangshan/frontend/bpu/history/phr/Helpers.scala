@@ -23,8 +23,9 @@ import xiangshan.frontend.PrunedAddr
 import xiangshan.frontend.PrunedAddrInit
 import xiangshan.frontend.bpu.FoldedHistoryInfo
 import xiangshan.frontend.bpu.HalfAlignHelper
+import xiangshan.frontend.bpu.PhrHelper
 
-trait Helpers extends HasPhrParameters with HalfAlignHelper {
+trait Helpers extends HasPhrParameters with HalfAlignHelper with PhrHelper {
   // folded History
   def circularShiftLeft(src: UInt, shamt: Int): UInt = {
     val srcLen     = src.getWidth
@@ -56,23 +57,17 @@ trait Helpers extends HasPhrParameters with HalfAlignHelper {
     res.asUInt
   }
 
-  def getBranchAddr(addr: PrunedAddr, cfiPosition: UInt): PrunedAddr = {
-    val alignedAddr = Cat(getAlignedAddrUpper(addr), 0.U(FetchBlockAlignWidth.W))
-    val brOffset    = Cat(cfiPosition, 0.U(instOffsetBits.W))
-    PrunedAddrInit(alignedAddr + brOffset)
-  }
-
   def pathHash(pc: PrunedAddr, target: PrunedAddr): UInt = {
     val hash = Cat(pc(9, 1), 0.U(4.W)) ^ target(16, 2) // magic numbers
     hash(PathHashWidth - 1, 0)
   }
 
-  def computeFoldedHist(hist: UInt, compLen: Int)(histLen: Int): UInt =
-    if (histLen > 0) {
-      val nChunks    = (histLen + compLen - 1) / compLen
-      val histChunks = (0 until nChunks) map { i => hist(min((i + 1) * compLen, histLen) - 1, i * compLen) }
-      ParallelXOR(histChunks)
-    } else 0.U
+  def getPathHashComponents(pc: PrunedAddr, target: PrunedAddr): (UInt, UInt) = {
+    val hash      = pathHash(pc, target)
+    val shiftBits = hash(Shamt - 1, 0)
+    val hashHigh  = hash(PathHashWidth - 1, Shamt)
+    (shiftBits, hashHigh)
+  }
 
   def computeFoldedHash(hashBits: UInt, compLen: Int)(histLen: Int): UInt =
     if (histLen > 0 && PathHashWidth >= histLen) {
@@ -85,4 +80,61 @@ trait Helpers extends HasPhrParameters with HalfAlignHelper {
       val histChunks = (0 until nChunks) map { i => hashBits(min((i + 1) * compLen, PathHashWidth) - 1, i * compLen) }
       ParallelXOR(histChunks)
     } else 0.U
+
+  def getUpdatePtrs(data: PhrUpdateData, hashHigh: UInt): PhrUpdateResult = {
+    val updateResult = WireInit(0.U.asTypeOf(new PhrUpdateResult))
+    when(data.valid) {
+      updateResult.phrPtr     := data.phrMeta.phrPtr
+      updateResult.phrLowBits := data.phrMeta.phrLowBits
+      when(data.taken) {
+        updateResult.phrPtr     := data.phrMeta.phrPtr - Shamt.U
+        updateResult.phrLowBits := hashHigh ^ data.phrMeta.phrLowBits
+      }
+    }
+    updateResult
+  }
+
+  def computeAllFoldedPhr(hist: UInt): PhrAllFoldedHistories = {
+    val foldedPhr = WireInit(0.U.asTypeOf(new PhrAllFoldedHistories(AllFoldedHistoryInfo)))
+    AllFoldedHistoryInfo.foreach { info =>
+      foldedPhr.getHistWithInfo(info).foldedHist :=
+        computeFoldedHist(hist, info.FoldedLength)(info.HistoryLength)
+    }
+    foldedPhr
+  }
+
+  def getNextFoldedPhr(
+      data:          PhrUpdateData,
+      baseFoldedPhr: PhrAllFoldedHistories,
+      basePhr:       UInt,
+      hashHigh:      UInt,
+      shiftBits:     UInt
+  ): PhrAllFoldedHistories = {
+    val nextFoldedPhr = WireInit(baseFoldedPhr)
+
+    when(data.taken) {
+      nextFoldedPhr := baseFoldedPhr.update(
+        VecInit(basePhr.asBools),
+        data.phrMeta.phrPtr,
+        hashHigh,
+        Shamt,
+        shiftBits
+      )
+    }
+    nextFoldedPhr
+  }
+
+  def getNextFoldedPhr(
+      data:          PhrUpdateData,
+      oldestBits:    PhrAllFoldedHistoryOldestBits,
+      baseFoldedPhr: PhrAllFoldedHistories,
+      hashHigh:      UInt,
+      shiftBits:     UInt
+  ): PhrAllFoldedHistories = {
+    val nextFoldedPhr = WireInit(baseFoldedPhr)
+    when(data.taken) {
+      nextFoldedPhr := baseFoldedPhr.update(oldestBits, hashHigh, Shamt, shiftBits)
+    }
+    nextFoldedPhr
+  }
 }

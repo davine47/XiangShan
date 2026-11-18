@@ -27,7 +27,8 @@ import sys
 import time
 import shlex
 import psutil
-import re
+import pathlib
+from typing import List, Tuple, Set
 
 def find_files_with_suffix(root_dir, suffixes):
     matching_files = []
@@ -51,7 +52,6 @@ class XSArgs(object):
     nemu_home = os.path.join(noop_home, "../NEMU")
     am_home = os.path.join(noop_home, "../nexus-am")
     dramsim3_home = os.path.join(noop_home, "../DRAMsim3")
-    rvtest_home = os.path.join(noop_home, "../riscv-tests")
     default_wave_home = os.path.join(noop_home, "build")
     wave_home   = default_wave_home
 
@@ -63,7 +63,6 @@ class XSArgs(object):
             (args.nemu, "NEMU_HOME", self.nemu_home, self.set_nemu_home),
             (args.am, "AM_HOME", self.am_home, self.set_am_home),
             (args.dramsim3, "DRAMSIM3_HOME", self.dramsim3_home, self.set_dramsim3_home),
-            (args.rvtest, "RVTEST_HOME", self.rvtest_home, self.set_rvtest_home),
         ]
         for (arg_in, env, default, set_func) in all_path:
             set_func(self.__extract_path(arg_in, env, default))
@@ -73,6 +72,7 @@ class XSArgs(object):
         # Makefile arguments
         self.threads = args.threads
         self.make_threads = args.make_threads
+        self.with_constantin = 1 if args.with_constantin else None
         self.with_dramsim3 = 1 if args.with_dramsim3 else None
         self.is_release = 1 if args.release else None
         self.is_spike = "Spike" if args.spike else None
@@ -84,24 +84,31 @@ class XSArgs(object):
         self.emu_optimize = args.emu_optimize
         self.xprop = 1 if args.xprop else None
         self.issue = args.issue
-        self.with_chiseldb = 0 if args.no_db else 1
+        self.llc = args.llc
+        self.with_chiseldb = 1 if args.enable_db or args.enable_rolling else 0
+        self.with_rollingdb = 1 if args.enable_rolling else None
         # emu arguments
         self.max_instr = args.max_instr
         self.ram_size = args.ram_size
-        self.seed = random.randint(0, 9999)
+        self.seed = args.seed if args.seed is not None else random.randint(0, 9999)
         self.numa = args.numa
+        self.numa_max_retry = args.numa_max_retry
         self.diff = args.diff
         if args.spike and "nemu" in args.diff:
             self.diff = self.diff.replace("nemu-interpreter", "spike")
         self.fork = not args.disable_fork
         self.disable_diff = args.no_diff
-        self.disable_db = args.no_db
+        self.dump_db = args.enable_db or args.enable_rolling
+        self.db_path = args.db_path
         self.gcpt_restore_bin = args.gcpt_restore_bin
         self.instr_trace = args.instr_trace
         self.pgo = args.pgo
         self.pgo_max_cycle = args.pgo_max_cycle
         self.pgo_emu_args = args.pgo_emu_args
         self.llvm_profdata = args.llvm_profdata
+        self.emulator = args.emulator
+        self.emu_trace_all = 1 if args.trace_all else None
+        self.flash = args.flash
         # wave dump path
         if args.wave_dump is not None:
             self.set_wave_home(args.wave_dump)
@@ -132,6 +139,7 @@ class XSArgs(object):
         makefile_args = [
             (self.threads,       "EMU_THREADS"),
             (self.with_dramsim3, "WITH_DRAMSIM3"),
+            (self.with_constantin, "WITH_CONSTANTIN"),
             (self.is_release,    "RELEASE"),
             (self.is_spike,      "REF"),
             (self.trace,         "EMU_TRACE"),
@@ -141,13 +149,16 @@ class XSArgs(object):
             (self.emu_optimize,  "EMU_OPTIMIZE"),
             (self.xprop,         "ENABLE_XPROP"),
             (self.with_chiseldb, "WITH_CHISELDB"),
+            (self.with_rollingdb, "WITH_ROLLINGDB"),
             (self.yaml_config,   "YAML_CONFIG"),
             (self.pgo,           "PGO_WORKLOAD"),
             (self.pgo_max_cycle, "PGO_MAX_CYCLE"),
             (self.pgo_emu_args,  "PGO_EMU_ARGS"),
             (self.llvm_profdata, "LLVM_PROFDATA"),
             (self.issue,         "ISSUE"),
+            (self.llc,           "LLC"),
             (self.simfrontend,   "ENABLE_SIMFRONTEND"),
+            (self.emu_trace_all, "EMU_TRACE_ALL"),
         ]
         args = filter(lambda arg: arg[0] is not None, makefile_args)
         args = [(shlex.quote(str(arg[0])), arg[1]) for arg in args] # shell escape
@@ -159,6 +170,7 @@ class XSArgs(object):
             (self.diff,      "diff"),
             (self.seed,      "seed"),
             (self.ram_size,  "ram-size"),
+            (self.db_path,   "db-path"),
         ]
         args = filter(lambda arg: arg[0] is not None, emu_args)
         return args
@@ -201,9 +213,6 @@ class XSArgs(object):
     def set_dramsim3_home(self, path):
         self.dramsim3_home = path
 
-    def set_rvtest_home(self, path):
-        self.rvtest_home = path
-
     def set_wave_home(self, path):
         print(f"set wave home to {path}")
         self.wave_home = path
@@ -213,6 +222,9 @@ class XiangShan(object):
     def __init__(self, args):
         self.args = XSArgs(args)
         self.timeout = args.timeout
+        self.numa_info = None
+        self.isa_smoke_runlist = args.isa_smoke_runlist
+        self.isa_smoke_extension = args.isa_smoke_extension
 
     def show(self):
         self.args.show()
@@ -245,7 +257,12 @@ class XiangShan(object):
         sim_args = " ".join(self.args.get_chisel_args(prefix="--"))
         make_args = " ".join(map(lambda arg: f"{arg[1]}={arg[0]}", self.args.get_makefile_args()))
         threads = self.args.make_threads
-        return_code = self.__exec_cmd(f'make -C $NOOP_HOME emu -j{threads} SIM_ARGS="{sim_args}" {make_args}')
+        if self.args.emulator == "verilator":
+            return_code = self.__exec_cmd(f'make -C $NOOP_HOME emu -j{threads} SIM_ARGS="{sim_args}" {make_args}')
+        elif self.args.emulator == "gsim":
+            return_code = self.__exec_cmd(f'make -C $NOOP_HOME gsim GSIM=1 -j{threads} SIM_ARGS="{sim_args}" {make_args}')
+        else:
+            raise ValueError(f"Unsupported emulator: {self.args.emulator}")
         return return_code
 
     def build_simv(self):
@@ -264,7 +281,7 @@ class XiangShan(object):
     def run_emu(self, workload):
         print("Running XiangShan emu with the following configurations:")
         self.show()
-        emu_args = " ".join(map(lambda arg: f"--{arg[1]} {arg[0]}", self.args.get_emu_args()))
+        emu_args = " ".join(map(lambda arg: f"--{arg[1]} {shlex.quote(str(arg[0]))}", self.args.get_emu_args()))
         print("workload:", workload)
         instr_trace = self.__get_ci_workloads_instr_trace(self.args.instr_trace)
         instr_trace_valid = len(instr_trace) != 0
@@ -272,14 +289,16 @@ class XiangShan(object):
             print("workload instr trace: ", instr_trace)
         numa_args = ""
         if self.args.numa:
-            numa_info = get_free_cores(self.args.threads)
-            numa_args = f"numactl -m {numa_info[0]} -C {numa_info[1]}-{numa_info[2]}"
+            if self.numa_info is None:
+                self.numa_info = get_free_cores(self.args.threads, self.args.numa_max_retry)
+            numa_args = f"numactl -m {self.numa_info[0]} -C {self.numa_info[1]}-{self.numa_info[2]}"
         fork_args = "--enable-fork" if self.args.fork else ""
         diff_args = "--no-diff" if self.args.disable_diff else ""
-        chiseldb_args = "--dump-db" if not self.args.disable_db else ""
+        chiseldb_args = "--dump-db" if self.args.dump_db else ""
         instr_trace_args = f"--instr-trace {instr_trace}" if instr_trace_valid else ""
         gcpt_restore_args = f"-r {self.args.gcpt_restore_bin}" if len(self.args.gcpt_restore_bin) != 0 else ""
-        return_code = self.__exec_cmd(f'ulimit -s {32 * 1024}; {numa_args} $NOOP_HOME/build/emu -i {workload} {emu_args} {fork_args} {diff_args} {chiseldb_args} {gcpt_restore_args} {instr_trace_args}')
+        flash_args = f"--flash {self.args.flash}" if self.args.flash is not None else ""
+        return_code = self.__exec_cmd(f'ulimit -s {32 * 1024}; {numa_args} $NOOP_HOME/build/emu -i {shlex.quote(workload)} {emu_args} {fork_args} {diff_args} {chiseldb_args} {gcpt_restore_args} {instr_trace_args} {flash_args}')
         return return_code
 
     def run_simv(self, workload):
@@ -331,22 +350,30 @@ class XiangShan(object):
             print(f"KeyboardInterrupt or TimeoutExpired.")
             return 0
 
-    def __get_ci_cputest(self, name=None):
-        # base_dir = os.path.join(self.args.am_home, "tests/cputest/build")
-        base_dir = "/nfs/home/share/ci-workloads/nexus-am-workloads/tests/cputest"
-        cputest = os.listdir(base_dir)
-        cputest = filter(lambda x: x.endswith(".bin"), cputest)
-        cputest = map(lambda x: os.path.join(base_dir, x), cputest)
-        return cputest
-
-    def __get_ci_rvtest(self, name=None):
-        base_dir = os.path.join(self.args.rvtest_home, "isa/build")
-        riscv_tests = os.listdir(base_dir)
-        riscv_tests = filter(lambda x: x.endswith(".bin"), riscv_tests)
-        all_rv_tests = ["rv64ui", "rv64um", "rv64ua", "rv64uf", "rv64ud", "rv64mi"]
-        riscv_tests = filter(lambda x: x[:6] in all_rv_tests, riscv_tests)
-        riscv_tests = map(lambda x: os.path.join(base_dir, x), riscv_tests)
-        return riscv_tests
+    def __get_ci_isa_smoke(self, name=None):
+        runlist_path = os.path.realpath(self.isa_smoke_runlist)
+        with open(runlist_path) as f:
+            runlist = json.load(f)
+        base_dir = os.path.normpath(os.path.join(os.path.dirname(runlist_path), runlist["binary_base"]))
+        extension_name = self.isa_smoke_extension
+        extensions = runlist["extensions"]
+        if extension_name is not None:
+            extensions = [extension for extension in extensions if extension["name"] == extension_name]
+            if not extensions:
+                raise ValueError(f"Unknown ISA smoke extension: {extension_name}")
+        workloads = [
+            os.path.join(base_dir, item["binary"])
+            for extension in extensions if extension["enabled"]
+            for item in extension["tests"] if item["enabled"]
+        ]
+        if not workloads:
+            if extension_name is None:
+                raise ValueError("ISA smoke runlist selects no tests")
+            print(f"Skipping ISA smoke extension with no enabled tests: {extension_name}")
+        for workload in workloads:
+            if not workload.endswith(".bin") or not os.path.isfile(workload):
+                raise ValueError(f"Missing or invalid ISA smoke binary: {workload}")
+        return workloads
 
     def __get_ci_misc(self, name=None):
         base_dir = "/nfs/home/share/ci-workloads"
@@ -434,85 +461,121 @@ class XiangShan(object):
             "rv64uzfh-p-ldst.bin",
             "rv64uzfh-p-move.bin",
             "rv64uzfh-p-recoding.bin",
-            "rv64uzvfh-p-vfadd.bin",
-            "rv64uzvfh-p-vfclass.bin",
-            "rv64uzvfh-p-vfcvtfx.bin",
-            "rv64uzvfh-p-vfcvtfxu.bin",
-            "rv64uzvfh-p-vfcvtrxf.bin",
-            "rv64uzvfh-p-vfcvtrxuf.bin",
-            "rv64uzvfh-p-vfcvtxf.bin",
-            "rv64uzvfh-p-vfcvtxuf.bin",
-            "rv64uzvfh-p-vfdiv.bin",
-            "rv64uzvfh-p-vfdown.bin",
-            "rv64uzvfh-p-vfmacc.bin",
-            "rv64uzvfh-p-vfmadd.bin",
-            "rv64uzvfh-p-vfmax.bin",
-            "rv64uzvfh-p-vfmerge.bin",
-            "rv64uzvfh-p-vfmin.bin",
-            "rv64uzvfh-p-vfmsac.bin",
-            "rv64uzvfh-p-vfmsub.bin",
-            "rv64uzvfh-p-vfmul.bin",
-            "rv64uzvfh-p-vfmv.bin",
-            "rv64uzvfh-p-vfncvtff.bin",
-            "rv64uzvfh-p-vfncvtfx.bin",
-            "rv64uzvfh-p-vfncvtfxu.bin",
-            "rv64uzvfh-p-vfncvtrff.bin",
-            "rv64uzvfh-p-vfncvtrxf.bin",
-            "rv64uzvfh-p-vfncvtrxuf.bin",
-            "rv64uzvfh-p-vfncvtxf.bin",
-            "rv64uzvfh-p-vfncvtxuf.bin",
-            "rv64uzvfh-p-vfnmacc.bin",
-            "rv64uzvfh-p-vfnmadd.bin",
-            "rv64uzvfh-p-vfnmsac.bin",
-            "rv64uzvfh-p-vfnmsub.bin",
-            "rv64uzvfh-p-vfrdiv.bin",
-            "rv64uzvfh-p-vfrec7.bin",
-            "rv64uzvfh-p-vfredmax.bin",
-            "rv64uzvfh-p-vfredmin.bin",
-            "rv64uzvfh-p-vfredosum.bin",
-            "rv64uzvfh-p-vfredusum.bin",
-            "rv64uzvfh-p-vfrsqrt7.bin",
-            "rv64uzvfh-p-vfrsub.bin",
-            "rv64uzvfh-p-vfsgnj.bin",
-            "rv64uzvfh-p-vfsgnjn.bin",
-            "rv64uzvfh-p-vfsgnjx.bin",
-            "rv64uzvfh-p-vfsqrt.bin",
-            "rv64uzvfh-p-vfsub.bin",
-            "rv64uzvfh-p-vfup.bin",
-            "rv64uzvfh-p-vfwadd.bin",
-            "rv64uzvfh-p-vfwadd-w.bin",
-            "rv64uzvfh-p-vfwcvtff.bin",
-            "rv64uzvfh-p-vfwcvtfx.bin",
-            "rv64uzvfh-p-vfwcvtfxu.bin",
-            "rv64uzvfh-p-vfwcvtrxf.bin",
-            "rv64uzvfh-p-vfwcvtrxuf.bin",
-            "rv64uzvfh-p-vfwcvtxf.bin",
-            "rv64uzvfh-p-vfwcvtxuf.bin",
-            "rv64uzvfh-p-vfwmacc.bin",
-            "rv64uzvfh-p-vfwmsac.bin",
-            "rv64uzvfh-p-vfwmul.bin",
-            "rv64uzvfh-p-vfwnmacc.bin",
-            "rv64uzvfh-p-vfwnmsac.bin",
-            "rv64uzvfh-p-vfwredosum.bin",
-            "rv64uzvfh-p-vfwredusum.bin",
-            "rv64uzvfh-p-vfwsub.bin",
-            "rv64uzvfh-p-vfwsub-w.bin",
-            "rv64uzvfh-p-vmfeq.bin",
-            "rv64uzvfh-p-vmfge.bin",
-            "rv64uzvfh-p-vmfgt.bin",
-            "rv64uzvfh-p-vmfle.bin",
-            "rv64uzvfh-p-vmflt.bin",
-            "rv64uzvfh-p-vmfne.bin"
+            # Temporarily disabled in CI due to the ongoing vector refactor.
+            # "rv64uzvfh-p-vfadd.bin",
+            # "rv64uzvfh-p-vfclass.bin",
+            # "rv64uzvfh-p-vfcvtfx.bin",
+            # "rv64uzvfh-p-vfcvtfxu.bin",
+            # "rv64uzvfh-p-vfcvtrxf.bin",
+            # "rv64uzvfh-p-vfcvtrxuf.bin",
+            # "rv64uzvfh-p-vfcvtxf.bin",
+            # "rv64uzvfh-p-vfcvtxuf.bin",
+            # "rv64uzvfh-p-vfdiv.bin",
+            # "rv64uzvfh-p-vfdown.bin",
+            # "rv64uzvfh-p-vfmacc.bin",
+            # "rv64uzvfh-p-vfmadd.bin",
+            # "rv64uzvfh-p-vfmax.bin",
+            # "rv64uzvfh-p-vfmerge.bin",
+            # "rv64uzvfh-p-vfmin.bin",
+            # "rv64uzvfh-p-vfmsac.bin",
+            # "rv64uzvfh-p-vfmsub.bin",
+            # "rv64uzvfh-p-vfmul.bin",
+            # "rv64uzvfh-p-vfmv.bin",
+            # "rv64uzvfh-p-vfncvtff.bin",
+            # "rv64uzvfh-p-vfncvtfx.bin",
+            # "rv64uzvfh-p-vfncvtfxu.bin",
+            # "rv64uzvfh-p-vfncvtrff.bin",
+            # "rv64uzvfh-p-vfncvtrxf.bin",
+            # "rv64uzvfh-p-vfncvtrxuf.bin",
+            # "rv64uzvfh-p-vfncvtxf.bin",
+            # "rv64uzvfh-p-vfncvtxuf.bin",
+            # "rv64uzvfh-p-vfnmacc.bin",
+            # "rv64uzvfh-p-vfnmadd.bin",
+            # "rv64uzvfh-p-vfnmsac.bin",
+            # "rv64uzvfh-p-vfnmsub.bin",
+            # "rv64uzvfh-p-vfrdiv.bin",
+            # "rv64uzvfh-p-vfrec7.bin",
+            # "rv64uzvfh-p-vfredmax.bin",
+            # "rv64uzvfh-p-vfredmin.bin",
+            # "rv64uzvfh-p-vfredosum.bin",
+            # "rv64uzvfh-p-vfredusum.bin",
+            # "rv64uzvfh-p-vfrsqrt7.bin",
+            # "rv64uzvfh-p-vfrsub.bin",
+            # "rv64uzvfh-p-vfsgnj.bin",
+            # "rv64uzvfh-p-vfsgnjn.bin",
+            # "rv64uzvfh-p-vfsgnjx.bin",
+            # "rv64uzvfh-p-vfsqrt.bin",
+            # "rv64uzvfh-p-vfsub.bin",
+            # "rv64uzvfh-p-vfup.bin",
+            # "rv64uzvfh-p-vfwadd.bin",
+            # "rv64uzvfh-p-vfwadd-w.bin",
+            # "rv64uzvfh-p-vfwcvtff.bin",
+            # "rv64uzvfh-p-vfwcvtfx.bin",
+            # "rv64uzvfh-p-vfwcvtfxu.bin",
+            # "rv64uzvfh-p-vfwcvtrxf.bin",
+            # "rv64uzvfh-p-vfwcvtrxuf.bin",
+            # "rv64uzvfh-p-vfwcvtxf.bin",
+            # "rv64uzvfh-p-vfwcvtxuf.bin",
+            # "rv64uzvfh-p-vfwmacc.bin",
+            # "rv64uzvfh-p-vfwmsac.bin",
+            # "rv64uzvfh-p-vfwmul.bin",
+            # "rv64uzvfh-p-vfwnmacc.bin",
+            # "rv64uzvfh-p-vfwnmsac.bin",
+            # "rv64uzvfh-p-vfwredosum.bin",
+            # "rv64uzvfh-p-vfwredusum.bin",
+            # "rv64uzvfh-p-vfwsub.bin",
+            # "rv64uzvfh-p-vfwsub-w.bin",
+            # "rv64uzvfh-p-vmfeq.bin",
+            # "rv64uzvfh-p-vmfge.bin",
+            # "rv64uzvfh-p-vmfgt.bin",
+            # "rv64uzvfh-p-vmfle.bin",
+            # "rv64uzvfh-p-vmflt.bin",
+            # "rv64uzvfh-p-vmfne.bin"
         ]
         f16_test = map(lambda x: os.path.join(base_dir, x), workloads)
         return f16_test
-    def __get_ci_zcbtest(self, name=None):
-        base_dir = "/nfs/home/share/ci-workloads/zcb-test"
+
+    def __get_ci_iopmptest(self, name=None):
+        base_dir = "/nfs/home/share/ci-workloads/iopmp"
         workloads = [
-            "zcb-test-riscv64-xs.bin"
+            "iopmp-riscv64-xs.bin"
         ]
-        zcb_test = map(lambda x: os.path.join(base_dir, x), workloads)
-        return zcb_test
+        iopmp_test = map(lambda x: os.path.join(base_dir, x), workloads)
+        return iopmp_test
+
+    def __get_ci_frontend_misc_test(self, name=None):
+        base_dir = "/nfs/home/share/ci-workloads/frontend"
+        workloads = [
+            # test single instruction fetch across page boundary, with different combinations of page attributes/permissions
+            "crosspage-fetch/pad2b_page1_exec_page2_exec-riscv64-xs.bin",       # normal
+            "crosspage-fetch/pad2b_page1_exec_page2_exec_io-riscv64-xs.bin",    # normal -> mmio
+            "crosspage-fetch/pad2b_page1_exec_page2_none-riscv64-xs.bin",       # normal -> page fault
+            "crosspage-fetch/pad2b_page1_exec_page2_io-riscv64-xs.bin",         # normal -> mmio page fault
+            "crosspage-fetch/pad2b_page1_exec_io_page2_exec-riscv64-xs.bin",    # mmio -> normal
+            "crosspage-fetch/pad2b_page1_exec_io_page2_exec_io-riscv64-xs.bin", # mmio
+            "crosspage-fetch/pad2b_page1_exec_io_page2_none-riscv64-xs.bin",    # mmio -> page fault
+            "crosspage-fetch/pad2b_page1_exec_io_page2_io-riscv64-xs.bin",      # mmio -> mmio page fault
+            "crosspage-fetch/pad2b_page1_none_page2_exec-riscv64-xs.bin",       # page fault
+            "crosspage-fetch/pad2b_page1_none_page2_exec_io-riscv64-xs.bin",    # page fault -> mmio
+            # test fetching from non-canonical pc
+            "fetch-canonical-check-test/sv39-riscv64-xs.bin",          # fall-through to a non-canonical pc (bpu)
+            "fetch-canonical-check-test/sv39-half-rvi-riscv64-xs.bin", # fall-through to a non-canonical pc (bpu), with a rvi crossing page
+            "fetch-canonical-check-test/sv39-beqz-riscv64-xs.bin",     # branch to a non-canonical pc (branchUnit)
+            "fetch-canonical-check-test/sv39-jal-riscv64-xs.bin",      # jump to a non-canonical pc (ifu)
+            "fetch-canonical-check-test/sv39-jalr-riscv64-xs.bin",     # indirect jump to a non-canonical pc (jumpUnit)
+            "fetch-canonical-check-test/sv39-mret-riscv64-xs.bin",     # mret to a non-canonical pc (csr)
+            "fetch-canonical-check-test/sv39-sret-riscv64-xs.bin",     # sret to a non-canonical pc (csr)
+            # test fetching from non-canonical pc again, but in sv48x4 mode
+            "fetch-canonical-check-test/sv48x4-riscv64-xs.bin",
+            "fetch-canonical-check-test/sv48x4-half-rvi-riscv64-xs.bin",
+            "fetch-canonical-check-test/sv48x4-beqz-riscv64-xs.bin",
+            "fetch-canonical-check-test/sv48x4-jal-riscv64-xs.bin",
+            "fetch-canonical-check-test/sv48x4-jalr-riscv64-xs.bin",
+            "fetch-canonical-check-test/sv48x4-mret-riscv64-xs.bin",
+            "fetch-canonical-check-test/sv48x4-sret-riscv64-xs.bin",
+            # we also have sv39x4, sv48, sv57, but 39 and 48x4 should cover all situation, so these are not included in the ci test.
+        ]
+        return map(lambda x: os.path.join(base_dir, x), workloads)
 
     def __get_ci_mc(self, name=None):
         base_dir = "/nfs/home/share/ci-workloads"
@@ -586,8 +649,7 @@ class XiangShan(object):
 
     def run_ci(self, test):
         all_tests = {
-            "cputest": self.__get_ci_cputest,
-            "riscv-tests": self.__get_ci_rvtest,
+            "isa-smoke": self.__get_ci_isa_smoke,
             "misc-tests": self.__get_ci_misc,
             "mc-tests": self.__get_ci_mc,
             "nodiff-tests": self.__get_ci_nodiff,
@@ -595,15 +657,18 @@ class XiangShan(object):
             "microbench": self.__am_apps_path,
             "coremark": self.__am_apps_path,
             "coremark-1-iteration": self.__am_apps_path,
-            "rvv-bench": self.__get_ci_rvvbench,
-            "rvv-test": self.__get_ci_rvvtest,
+            # Temporarily disabled in CI due to the ongoing vector refactor.
+            # "rvv-bench": self.__get_ci_rvvbench,
+            # "rvv-test": self.__get_ci_rvvtest,
             "f16_test": self.__get_ci_F16test,
-            "zcb-test": self.__get_ci_zcbtest
+            "iopmp-test": self.__get_ci_iopmptest,
+            "frontend-misc-test": self.__get_ci_frontend_misc_test,
         }
         for target in all_tests.get(test, self.__get_ci_workloads)(test):
             print(target)
             ret = self.run_emu(target)
             if ret:
+                print(f"Failed workload: {target} (exit code: {ret})")
                 if self.args.default_wave_home != self.args.wave_home:
                     print("copy wave file to " + self.args.wave_home)
                     self.__exec_cmd(f"cp $NOOP_HOME/build/*.vcd $WAVE_HOME")
@@ -616,8 +681,6 @@ class XiangShan(object):
 
     def run_ci_vcs(self, test):
         all_tests = {
-            "cputest": self.__get_ci_cputest,
-            "riscv-tests": self.__get_ci_rvtest,
             "misc-tests": self.__get_ci_misc,
             "mc-tests": self.__get_ci_mc,
             "nodiff-tests": self.__get_ci_nodiff,
@@ -625,10 +688,12 @@ class XiangShan(object):
             "microbench": self.__am_apps_path,
             "coremark": self.__am_apps_path,
             "coremark-1-iteration": self.__am_apps_path,
-            "rvv-bench": self.__get_ci_rvvbench,
-            "rvv-test": self.__get_ci_rvvtest,
+            # Temporarily disabled in CI due to the ongoing vector refactor.
+            # "rvv-bench": self.__get_ci_rvvbench,
+            # "rvv-test": self.__get_ci_rvvtest,
             "f16_test": self.__get_ci_F16test,
-            "zcb-test": self.__get_ci_zcbtest
+            "iopmp-test": self.__get_ci_iopmptest,
+            "frontend-misc-test": self.__get_ci_frontend_misc_test,
         }
         for target in all_tests.get(test, self.__get_ci_workloads)(test):
             print(target)
@@ -643,29 +708,99 @@ class XiangShan(object):
                 return ret
         return 0
 
-def get_free_cores(n):
-    numa_re = re.compile(r'.*numactl +.*-C +([0-9]+)-([0-9]+).*')
-    while True:
-        disable_cores = []
-        for proc in psutil.process_iter():
+def get_free_cores(n: int, max_retry: int = 60) -> Tuple[int, int, int]:
+    '''get contiguous free N cores that numactl can bind to, return (numa_node, start_core, end_core)'''
+    def get_numa_count() -> int:
+        '''get numa node count'''
+        node_dir = pathlib.Path("/sys/devices/system/node/")
+        return len(list(node_dir.glob("node*")))
+
+    def get_cpu_usage() -> List[float]:
+        '''get cpu usage of all cores'''
+        return psutil.cpu_percent(interval=0.5, percpu=True)
+
+    def get_physical_cores() -> Set[int]:
+        '''get all physical cores'''
+        count = psutil.cpu_count(logical=False)
+        if count is None:
+            raise RuntimeError("Failed to get physical core count")
+        return set(range(count))
+
+    def get_usable_cores() -> Set[int]:
+        '''get all cores current process can bind to'''
+        return os.sched_getaffinity(0)
+
+    def get_bound_cores() -> Set[int]:
+        '''get all cores that are already bound by other processes'''
+        valid_list = ["running", "disk-sleep", "waking", "waiting"]
+        cores = set()
+        for proc in psutil.process_iter(["pid", "name", "cpu_affinity", "status"]):
             try:
-                joint = ' '.join(proc.cmdline())
-                numa_match = numa_re.match(joint)
-                if numa_match and 'ssh' not in proc.name():
-                    disable_cores.extend(range(int(numa_match.group(1)), int(numa_match.group(2)) + 1))
+                # our script usually bind <= 16 cores for verilator, only consider these processes, so skip if len > 16
+                if not proc.info["status"] in valid_list or len(proc.info["cpu_affinity"]) > 16:
+                    continue
+                cores |= set(proc.info["cpu_affinity"])
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                 pass
-        num_logical_core = psutil.cpu_count(logical=False)
-        core_usage = psutil.cpu_percent(interval=1, percpu=True)
-        num_window = num_logical_core // n
-        for i in range(num_window):
-            if set(disable_cores) & set(range(i * n, i * n + n)):
-                continue
+
+        return cores
+
+    def detect(n: int) -> Tuple[bool, int, int, int]:
+        numa_count = get_numa_count()
+        phy_cores = get_physical_cores() # invariant, get once
+        num_core = len(phy_cores)
+        num_window = num_core // n
+
+        def check(i) -> bool:
+            window = range(i * n, i * n + n)
+            # may change during execution (other processes may taskset this process), get in loop
+            candidates = phy_cores & get_usable_cores()
+            if not set(window).issubset(candidates): # fail-fast
+                return False
+
+            # then get unused cores in phy_cores & usable_cores
+            candidates -= get_bound_cores()
+            if not set(window).issubset(candidates): # fail-fast
+                return False
+
+            core_usage = get_cpu_usage()
             window_usage = core_usage[i * n : i * n + n]
-            if sum(window_usage) < 30 * n and True not in map(lambda x: x > 90, window_usage):
-                return (((i * n) % num_logical_core) // (num_logical_core // 2), i * n, i * n + n - 1)
-        print(f"No free {n} cores found. CPU usage: {core_usage}\n")
-        time.sleep(random.uniform(1, 60))
+
+            return (
+                # average usage of window_cores less than percpu_use_thres
+                sum(window_usage) < 30 * n and
+                # less than 1 core has high usage in window_cores
+                sum(map(lambda x: x > 80, window_usage)) < 1
+            )
+
+        for i in random.sample(range(num_window), num_window):
+            if not check(i):
+                continue
+
+            # sleep random time to avoid contention, then re-check
+            time.sleep(random.uniform(0, 10))
+            if not check(i):
+                continue
+
+            # return (Success?, memory node, start_core, end_core)
+            return (
+                True,
+                (int)(((i * n) % num_core) // (num_core // numa_count)),
+                (int)(i * n),
+                (int)(i * n + n - 1),
+            )
+
+        return (False, 0, 0, 0)
+
+    for _ in range(max_retry):
+        success, node, start_core, end_core = detect(n)
+        if success:
+            print(f"Found free cores: {start_core}-{end_core} on NUMA node {node}")
+            return (node, start_core, end_core)
+        print("No free cores found, retry after 60 seconds...")
+        time.sleep(60)
+
+    raise RuntimeError(f"Failed to find {n} free cores after {max_retry} retries")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Python wrapper for XiangShan')
@@ -676,7 +811,11 @@ if __name__ == "__main__":
     parser.add_argument('--generate', action='store_true', help='generate XS verilog')
     parser.add_argument('--vcs-gen', action='store_true', help='generate XS sim verilog for vcs')
     parser.add_argument('--vcs-build', action='store_true', help='build XS simv')
-    parser.add_argument('--ci', nargs='?', type=str, const="", help='run CI tests')
+    parser.add_argument('--ci', nargs='?', type=str, const="", help='run CI tests (isa-smoke selects ISA tests)')
+    parser.add_argument('--isa-smoke-runlist', default='/nfs/home/share/ci-workloads/isa-smoke-tests/runlist.json',
+                        help='path to the ISA smoke test runlist')
+    parser.add_argument('--isa-smoke-extension', type=str,
+                        help='run only the named ISA smoke extension (all enabled extensions by default)')
     parser.add_argument('--ci-vcs', nargs='?', type=str, const="", help='run CI tests on simv')
     parser.add_argument('--clean', action='store_true', help='clean up XiangShan CI workspace')
     parser.add_argument('--timeout', nargs='?', type=int, default=None, help='timeout (in seconds)')
@@ -684,7 +823,6 @@ if __name__ == "__main__":
     parser.add_argument('--nemu', nargs='?', type=str, help='path to nemu')
     parser.add_argument('--am', nargs='?', type=str, help='path to nexus-am')
     parser.add_argument('--dramsim3', nargs='?', type=str, help='path to dramsim3')
-    parser.add_argument('--rvtest', nargs='?', type=str, help='path to riscv-tests')
     parser.add_argument('--wave-dump', nargs='?', type=str , help='path to dump wave')
     # chisel arguments
     parser.add_argument('--enable-log', action='store_true', help='enable log')
@@ -692,19 +830,23 @@ if __name__ == "__main__":
     # makefile arguments
     parser.add_argument('--release', action='store_true', help='enable release')
     parser.add_argument('--spike', action='store_true', help='enable spike diff')
+    parser.add_argument('--with-constantin', action='store_true', help='enable constantin')
     parser.add_argument('--with-dramsim3', action='store_true', help='enable dramsim3')
     parser.add_argument('--threads', nargs='?', type=int, help='number of emu threads')
     parser.add_argument('--make-threads', nargs='?', type=int, help='number of make threads', default=200)
     parser.add_argument('--trace', action='store_true', help='enable vcd waveform')
     parser.add_argument('--trace-fst', action='store_true', help='enable fst waveform')
+    parser.add_argument('--trace-all', action='store_true', help='enable EMU_TRACE_ALL for makefile')
     parser.add_argument('--config', nargs='?', type=str, help='config')
     parser.add_argument('--yaml-config', nargs='?', type=str, help='yaml config')
     parser.add_argument('--emu-optimize', nargs='?', type=str, help='verilator optimization letter')
     parser.add_argument('--xprop', action='store_true', help='enable xprop for vcs')
     parser.add_argument('--issue', nargs='?', type=str, help='CHI issue')
+    parser.add_argument('--llc', nargs='?', type=str, help='LLC backend (OpenLLC or ZhuJiang)')
     parser.add_argument('--simfrontend', action='store_true', help='enable the simfrontend')
     # emu arguments
     parser.add_argument('--numa', action='store_true', help='use numactl')
+    parser.add_argument('--numa-max-retry', type=int, default=60, help='max retry to find free numa cores')
     parser.add_argument('--diff', nargs='?', default="./ready-to-run/riscv64-nemu-interpreter-so", type=str, help='nemu so')
     parser.add_argument('--max-instr', nargs='?', type=int, help='max instr')
     parser.add_argument('--disable-fork', action='store_true', help='disable lightSSS')
@@ -712,12 +854,17 @@ if __name__ == "__main__":
     parser.add_argument('--ram-size', nargs='?', type=str, help='manually set simulation memory size (8GB by default)')
     parser.add_argument('--gcpt-restore-bin', type=str, default="", help="specify the bin used to restore from gcpt")
     parser.add_argument('--instr-trace', type=str, default="", help="run the test with the trace of the simfrontend")
+    parser.add_argument('--seed', type=int, help="run emu with the given random seed")
+    parser.add_argument('--flash', type=str, help="Path to flash image for copy_and_run")
     # both makefile and emu arguments
-    parser.add_argument('--no-db', action='store_true', help='disable chiseldb dump')
+    parser.add_argument('--dump-db', '--enable-db', dest='enable_db', action='store_true', help='enable chiseldb dump')
+    parser.add_argument('--enable-rolling', action='store_true', help='enable rolling db dump, implies --enable-db')
+    parser.add_argument('--db-path', type=str, help='dump chiseldb to the specified file path')
     parser.add_argument('--pgo', nargs='?', type=str, help='workload for pgo (null to disable pgo)')
     parser.add_argument('--pgo-max-cycle', nargs='?', default=400000, type=int, help='maximun cycle to train pgo')
     parser.add_argument('--pgo-emu-args', nargs='?', default='--no-diff', type=str, help='emu arguments for pgo')
     parser.add_argument('--llvm-profdata', nargs='?', type=str, help='corresponding llvm-profdata command of clang to compile emu, do not set with GCC')
+    parser.add_argument('--emulator', choices=['verilator', 'gsim'], default='verilator', type=str, help='use verilator or gsim to compile emu')
 
     args = parser.parse_args()
 

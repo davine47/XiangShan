@@ -15,14 +15,10 @@ class RedirectGenerator(implicit p: Parameters) extends XSModule
 
     val hartId = Input(UInt(8.W))
     val oldestExuRedirect = Flipped(ValidIO(new Redirect))
-    val oldestExuRedirectIsCSR = Input(Bool())
-    val instrAddrTransType = Input(new AddrTransType)
     val loadReplay = Flipped(ValidIO(new Redirect))
     val robFlush = Flipped(ValidIO(new Redirect))
     val stage2Redirect = ValidIO(new Redirect)
 
-    val memPredUpdate = Output(new MemPredUpdateReq)
-    val memPredPcRead = new FtqRead(UInt(VAddrBits.W)) // read req send form stage 2
     val stage2oldestOH = Output(UInt((1 + 1).W))
   }
 
@@ -32,12 +28,6 @@ class RedirectGenerator(implicit p: Parameters) extends XSModule
   val robFlush = io.robFlush
   val oldestExuRedirect = Wire(chiselTypeOf(io.oldestExuRedirect))
   oldestExuRedirect := io.oldestExuRedirect
-  oldestExuRedirect.bits.fullTarget := Cat(io.oldestExuRedirect.bits.fullTarget.head(XLEN - VAddrBits), io.oldestExuRedirect.bits.target)
-  when(!io.oldestExuRedirectIsCSR){
-    oldestExuRedirect.bits.backendIAF := io.instrAddrTransType.checkAccessFault(oldestExuRedirect.bits.fullTarget)
-    oldestExuRedirect.bits.backendIPF := io.instrAddrTransType.checkPageFault(oldestExuRedirect.bits.fullTarget)
-    oldestExuRedirect.bits.backendIGPF := io.instrAddrTransType.checkGuestPageFault(oldestExuRedirect.bits.fullTarget)
-  }
   val allRedirect: Vec[ValidIO[Redirect]] = VecInit(oldestExuRedirect, loadRedirect)
   val oldestOneHot = Redirect.selectOldestRedirect(allRedirect)
   val flushAfter = RegInit(0.U.asTypeOf(ValidIO(new Redirect)))
@@ -70,22 +60,5 @@ class RedirectGenerator(implicit p: Parameters) extends XSModule
   io.stage2Redirect.bits := s1_redirect_bits_reg
   io.stage2oldestOH := s1_redirect_onehot.asUInt
 
-  val s1_isReplay = s1_redirect_onehot.last
-
-  // get pc from ftq
-  // valid only if redirect is caused by load violation
-  // store_pc is used to update store set
-  val store_pc = io.memPredPcRead(s1_redirect_valid_reg, s1_redirect_bits_reg.stFtqIdx, s1_redirect_bits_reg.stFtqOffset)
-  val real_pc = s1_redirect_bits_reg.pc
-  // update load violation predictor if load violation redirect triggered
-  val s2_redirect_bits_reg = RegEnable(s1_redirect_bits_reg, s1_redirect_valid_reg)
-  io.memPredUpdate.valid := GatedValidRegNext(s1_isReplay && s1_redirect_valid_reg && s1_redirect_bits_reg.flushItself(), init = false.B)
-  // update wait table
-  io.memPredUpdate.waddr := RegEnable(XORFold(real_pc(VAddrBits - 1, 1), MemPredPCWidth), s1_isReplay && s1_redirect_valid_reg)
-  io.memPredUpdate.wdata := true.B
-  // update store set
-  io.memPredUpdate.ldpc := RegEnable(XORFold(real_pc(VAddrBits - 1, 1), MemPredPCWidth), s1_isReplay && s1_redirect_valid_reg)
-  // store pc is ready 1 cycle after s1_isReplay is judged
-  io.memPredUpdate.stpc := RegEnable(XORFold(store_pc(VAddrBits - 1, 1), MemPredPCWidth), s1_isReplay && s1_redirect_valid_reg)
 
 }

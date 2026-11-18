@@ -18,55 +18,107 @@ package xiangshan.frontend.bpu.sc
 import chisel3._
 import chisel3.util._
 import org.chipsalliance.cde.config.Parameters
-import xiangshan.frontend.PrunedAddr
+import xiangshan.XSCoreParamsKey
+import xiangshan.frontend.Pc
 import xiangshan.frontend.bpu.SaturateCounter
+import xiangshan.frontend.bpu.SaturateCounterFactory
+import xiangshan.frontend.bpu.SaturateCounterInit
 import xiangshan.frontend.bpu.SignedSaturateCounter
+import xiangshan.frontend.bpu.SignedSaturateCounterFactory
 import xiangshan.frontend.bpu.WriteReqBundle
+import xiangshan.frontend.bpu.history.commonhr.CommonHREntry
+
+object Counter extends SignedSaturateCounterFactory {
+  def width(implicit p: Parameters): Int =
+    p(XSCoreParamsKey).frontendParameters.bpuParameters.scParameters.CtrWidth
+}
+
+object ThresholdCounter extends SaturateCounterFactory {
+  def width(implicit p: Parameters): Int =
+    p(XSCoreParamsKey).frontendParameters.bpuParameters.scParameters.ThresholdWidth
+
+  def Init(implicit p: Parameters): SaturateCounter =
+    SaturateCounterInit(width, p(XSCoreParamsKey).frontendParameters.bpuParameters.scParameters.ThresholdInit)
+}
 
 class ScEntry(implicit p: Parameters) extends ScBundle {
-  val ctr: SignedSaturateCounter = new SignedSaturateCounter(ctrWidth)
+  val ctr: SignedSaturateCounter = Counter()
 }
 
-class ScThreshold(implicit p: Parameters) extends ScBundle {
-  val thres: SaturateCounter = new SaturateCounter(thresholdThresWidth)
+class ScTableSramWriteReq(val numSets: Int, val numWays: Int)(implicit p: Parameters) extends WriteReqBundle
+    with HasScParameters {
+  val setIdx:           UInt              = UInt(log2Ceil(numSets).W)
+  override val wayMask: Option[Vec[Bool]] = Some(Vec(numWays, Bool()))
+  override val wayData: Option[Vec[UInt]] = Some(Vec(numWays, UInt((new ScEntry).getWidth.W)))
 
-  def initVal: UInt = 6.U
-
-  def update(cause: Bool): ScThreshold = {
-    val res = Wire(new ScThreshold())
-    res.thres.value := this.thres.getUpdate(cause)
-    res
-  }
 }
 
-object ScThreshold {
-  def apply(implicit p: Parameters): ScThreshold = {
-    val t = Wire(new ScThreshold())
-    t.thres.value := t.initVal
-    t
-  }
+class ScTableReq(val numSets: Int, val numWays: Int)(implicit p: Parameters) extends ScBundle {
+  val setIdx:   UInt = UInt(log2Ceil(numSets).W)
+  val bankMask: UInt = UInt(NumBanks.W)
 }
 
-class PathTableSramWriteReq(val numSets: Int)(implicit p: Parameters) extends WriteReqBundle with HasScParameters {
-  val setIdx:   UInt         = UInt(log2Ceil(numSets).W)
-  val wayMask:  Vec[Bool]    = Vec(NumWays, Bool())
-  val entryVec: Vec[ScEntry] = Vec(NumWays, new ScEntry())
-}
-
-class PathTableTrain(val numSets: Int)(implicit p: Parameters) extends ScBundle {
+class ScTableTrain(val numSets: Int, val numWays: Int)(implicit p: Parameters) extends ScBundle {
   val valid:    Bool         = Bool()
-  val setIdx:   UInt         = UInt(log2Ceil(numSets / NumBanks).W)
-  val wayMask:  Vec[Bool]    = Vec(NumWays, Bool())
-  val entryVec: Vec[ScEntry] = Vec(NumWays, new ScEntry())
+  val setIdx:   UInt         = UInt(log2Ceil(numSets).W)
+  val bankMask: UInt         = UInt(NumBanks.W)
+  val wayMask:  Vec[Bool]    = Vec(numWays, Bool())
+  val entryVec: Vec[ScEntry] = Vec(numWays, new ScEntry())
 }
 
 class ScMeta(implicit p: Parameters) extends ScBundle with HasScParameters {
   // NOTE: Seems ChiselDB has problem dealing with SInt, so we do not use ScEntry for scResp here
   // FIXME: is there a better way to do this?
   private def ScEntryWidth = (new ScEntry).getWidth
-  val scPathResp:   Vec[Vec[UInt]] = Vec(PathTableSize, Vec(NumWays, UInt(ScEntryWidth.W)))
-  val scGlobleResp: Vec[Vec[UInt]] = Vec(GlobalTableSize, Vec(NumWays, UInt(ScEntryWidth.W)))
-  val scGhr:        UInt           = UInt(GhrHistoryLength.W)
-  val scPred:       Vec[Bool]      = Vec(NumWays, Bool())
-  val useScPred:    Vec[Bool]      = Vec(NumWays, Bool())
+  val scBiasLowerBits: Vec[UInt] = Vec(NumBtbResultEntries, UInt(BiasUseTageBitWidth.W))
+  val scPred:          Vec[Bool] = Vec(NumBtbResultEntries, Bool())
+  val tagePred:        Vec[Bool] = Vec(NumBtbResultEntries, Bool())
+  val tageCtr:         Vec[UInt] = Vec(NumBtbResultEntries, UInt(TageTakenCtrWidth.W))
+  val tagePredValid:   Vec[Bool] = Vec(NumBtbResultEntries, Bool())
+  val useScPred:       Vec[Bool] = Vec(NumBtbResultEntries, Bool())
+  val sumAboveThres:   Vec[Bool] = Vec(NumBtbResultEntries, Bool())
+
+  // for debug
+  val debug_scPathTakenVec:   Option[Vec[Bool]] = Some(Vec(NumBtbResultEntries, Bool()))
+  val debug_scGlobalTakenVec: Option[Vec[Bool]] = Some(Vec(NumBtbResultEntries, Bool()))
+  val debug_scBWTakenVec:     Option[Vec[Bool]] = Some(Vec(NumBtbResultEntries, Bool()))
+  val debug_scImliTakenVec:   Option[Vec[Bool]] = Some(Vec(NumBtbResultEntries, Bool()))
+  val debug_scBiasTakenVec:   Option[Vec[Bool]] = Some(Vec(NumBtbResultEntries, Bool()))
+  val debug_predPathIdx: Option[MixedVec[UInt]] =
+    Some(MixedVec(PathTableInfos.map(info => UInt(log2Ceil(info.NumSets).W))))
+  val debug_predGlobalIdx: Option[MixedVec[UInt]] =
+    Some(MixedVec(GlobalTableInfos.map(info => UInt(log2Ceil(info.NumSets).W))))
+  val debug_predBWIdx: Option[MixedVec[UInt]] =
+    Some(MixedVec(BackwardTableInfos.map(info => UInt(log2Ceil(info.NumSets).W))))
+  val debug_predImliIdx: Option[UInt] = Some(UInt(log2Ceil(ImliTableInfo.NumSets).W))
+  val debug_predBiasIdx: Option[UInt] = Some(UInt(log2Ceil(BiasTableInfo.NumSets).W))
+}
+
+class ScConditionalBranchTrace(implicit p: Parameters) extends ScBundle with HasScParameters {
+  private def ScEntryWidth = (new ScEntry).getWidth
+  val startPc: Pc   = Pc()
+  val cfiPc:   UInt = UInt(VAddrBits.W)
+  // tage provider info
+  val providerValid: Bool = Bool()
+  val providerTaken: Bool = Bool()
+  val providerCtr:   UInt = UInt(TageTakenCtrWidth.W)
+  // sc resp
+  val pathResp:   Vec[UInt] = Vec(NumPathTables, UInt(ScEntryWidth.W))
+  val globalResp: Vec[UInt] = Vec(NumGlobalTables, UInt(ScEntryWidth.W))
+  val biasResp:   UInt      = UInt(ScEntryWidth.W)
+  // sc pred
+  val sumAboveThres: Bool = Bool()
+  val scPred:        Bool = Bool()
+  val useSc:         Bool = Bool()
+
+  // actual
+  val actualTaken: Bool = Bool()
+  val mispredict:  Bool = Bool()
+
+  val scCorrectTageWrong:   Bool = Bool()
+  val scWrongTageCorrect:   Bool = Bool()
+  val scCorrectTageCorrect: Bool = Bool()
+  val scWrongTageWrong:     Bool = Bool()
+  val scWrong:              Bool = Bool()
+  val scCorrect:            Bool = Bool()
 }

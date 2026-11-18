@@ -29,41 +29,18 @@ class Entries(implicit p: Parameters, params: IssueBlockParams) extends XSModule
   private val CompEntryNum        = params.numComp
   val io = IO(new EntriesIO)
 
-  // only memAddrIQ use it
-  val memEtyResps: Seq[ValidIO[EntryDeqRespBundle]] = {
-    val resps =
-      if (params.isLdAddrIQ && !params.isStAddrIQ)                                                    //LDU
-        Seq(io.fromLoad.get.finalIssueResp, io.fromLoad.get.memAddrIssueResp)
-      else if (params.isLdAddrIQ && params.isStAddrIQ || params.isHyAddrIQ)                           //HYU
-        Seq(io.fromLoad.get.finalIssueResp, io.fromLoad.get.memAddrIssueResp, io.fromMem.get.fastResp, io.fromMem.get.slowResp)
-      else if (params.isStAddrIQ)                                                                     //STU
-        Seq(io.fromMem.get.slowResp)
-      else if (params.isVecLduIQ && params.isVecStuIQ) // Vector store IQ need no vecLdIn.resp, but for now vector store share the vector load IQ
-        Seq(io.vecLdIn.get.resp, io.fromMem.get.slowResp, io.vecLdIn.get.finalIssueResp)
-      else Seq()
-    if (params.isMemAddrIQ) {
-      println(s"[${this.desiredName}] resp: {" +
-        s"og0Resp: ${resps.contains(io.og0Resp)}, " +
-        s"og1Resp: ${resps.contains(io.og1Resp)}, " +
-        s"finalResp: ${io.fromLoad.nonEmpty && resps.contains(io.fromLoad.get.finalIssueResp)}, " +
-        s"loadBorderResp: ${io.fromLoad.nonEmpty && resps.contains(io.fromLoad.get.memAddrIssueResp)}, " +
-        s"memFastResp: ${io.fromMem.nonEmpty && resps.contains(io.fromMem.get.fastResp)}, " +
-        s"memSlowResp: ${io.fromMem.nonEmpty && resps.contains(io.fromMem.get.slowResp)}, " +
-        s"vecLoadBorderResp: ${io.vecLdIn.nonEmpty && resps.contains(io.vecLdIn.get.resp)}, " +
-        s"}"
-      )
-    }
-    resps.flatten
-  }
-
-  val resps: Vec[Vec[ValidIO[EntryDeqRespBundle]]] = Wire(Vec(4, chiselTypeOf(io.og0Resp)))
-
-  if (params.needOg2Resp)
-    resps := Seq(io.og0Resp, io.og1Resp, io.og2Resp.get, WireDefault(0.U.asTypeOf(io.og0Resp)))
-  else
-    resps := Seq(io.og0Resp, io.og1Resp, WireDefault(0.U.asTypeOf(io.og0Resp)), WireDefault(0.U.asTypeOf(io.og0Resp)))
-
-
+  val fakeS1Resp = Option.when(params.needFakeS1Resp)(0.U.asTypeOf(io.og0Resp))
+  val allResps = Seq(
+    Some(io.og0Resp),
+    Some(io.og1Resp),
+    io.og2Resp.orElse(io.s0Resp),
+    if (io.og2Resp.nonEmpty) io.s0Resp else io.s1Resp.orElse(fakeS1Resp),
+    if (io.og2Resp.nonEmpty) io.s1Resp.orElse(fakeS1Resp) else io.s2Resp,
+    io.snResp
+  ).filter(_.nonEmpty).map(_.get)
+  assert(allResps.length == params.issueTimerMaxValue + 1, "allResps.length == params.issueTimerMaxValue + 1")
+  val resps = Wire(Vec(allResps.length, chiselTypeOf(io.og0Resp)))
+  resps := allResps
 
   //Module
   val enqEntries          = Seq.fill(EnqEntryNum)(Module(EnqEntry(isComp = true)(p, params)))
@@ -76,7 +53,7 @@ class Entries(implicit p: Parameters, params: IssueBlockParams) extends XSModule
 
   //Wire
   //entries status
-  val entries             = Wire(Vec(params.numEntries, ValidIO(new EntryBundle)))
+  val entries             = Wire(Vec(params.numEntries, ValidIO(new EntryBundle(isDeq = true))))
   val robIdxVec           = Wire(Vec(params.numEntries, new RobPtr))
   val validVec            = Wire(Vec(params.numEntries, Bool()))
   val issuedVec           = Wire(Vec(params.numEntries, Bool()))
@@ -86,16 +63,16 @@ class Entries(implicit p: Parameters, params: IssueBlockParams) extends XSModule
   val rfWenVec            = Wire(Vec(params.numEntries, Bool()))
   val fuTypeVec           = Wire(Vec(params.numEntries, FuType()))
   val isFirstIssueVec     = Wire(Vec(params.numEntries, Bool()))
-  val issueTimerVec       = Wire(Vec(params.numEntries, UInt(2.W)))
-  val sqIdxVec            = OptionWrapper(params.needFeedBackSqIdx || params.needFeedBackLqIdx, Wire(Vec(params.numEntries, new SqPtr())))
-  val lqIdxVec            = OptionWrapper(params.needFeedBackSqIdx || params.needFeedBackLqIdx, Wire(Vec(params.numEntries, new LqPtr())))
+  val issueTimerVec       = Wire(Vec(params.numEntries, UInt(params.issueTimerWidth.W)))
+  val lqIdxVec            = OptionWrapper(params.needFeedBackLqIdx, Wire(Vec(params.numEntries, new LqPtr())))
+  val validVecRegNext     = Wire(Vec(params.numEntries, Bool()))
+  val issuedVecRegNext    = Wire(Vec(params.numEntries, Bool()))
   //src status
-  val dataSourceVec       = Wire(Vec(params.numEntries, Vec(params.numRegSrc, DataSource())))
   val loadDependencyVec   = Wire(Vec(params.numEntries, Vec(LoadPipelineWidth, UInt(LoadDependencyWidth.W))))
   val exuSourceVec        = OptionWrapper(params.hasIQWakeUp, Wire(Vec(params.numEntries, Vec(params.numRegSrc, ExuSource()))))
   //deq sel
   val deqSelVec           = Wire(Vec(params.numEntries, Bool()))
-  val issueRespVec        = Wire(Vec(params.numEntries, ValidIO(new EntryDeqRespBundle)))
+  val issueRespVec        = Wire(Vec(params.numEntries, new IssueQueueRespBundle))
   val deqPortIdxWriteVec  = Wire(Vec(params.numEntries, UInt(1.W)))
   val deqPortIdxReadVec   = Wire(Vec(params.numEntries, UInt(1.W)))
   //trans sel
@@ -129,6 +106,8 @@ class Entries(implicit p: Parameters, params: IssueBlockParams) extends XSModule
   val perfOg0CancelVec       = OptionWrapper(params.hasIQWakeUp, Wire(Vec(params.numEntries, Vec(params.numRegSrc, Bool()))))
   val perfWakeupByWBVec      = Wire(Vec(params.numEntries, Vec(params.numRegSrc, Bool())))
   val perfWakeupByIQVec      = OptionWrapper(params.hasIQWakeUp, Wire(Vec(params.numEntries, Vec(params.numRegSrc, Vec(params.numWakeupFromIQ, Bool())))))
+  val debugCancelSourceVec   = OptionWrapper(backendParams.debugEn, Wire(Vec(params.numEntries, IQCancelSource())))
+  val debugSrcReadyVec       = OptionWrapper(backendParams.debugEn, Wire(Vec(params.numEntries, Bool())))
   //cancel bypass
   val cancelBypassVec        = Wire(Vec(params.numEntries, Bool()))
 
@@ -270,36 +249,20 @@ class Entries(implicit p: Parameters, params: IssueBlockParams) extends XSModule
     dontTouch(othersEntryEnqVec)
   }
 
-  //issueRespVec
-  if (params.needFeedBackSqIdx || params.needFeedBackLqIdx) {
-    issueRespVec.lazyZip(sqIdxVec.get.zip(lqIdxVec.get)).lazyZip(issueTimerVec.lazyZip(deqPortIdxReadVec)).foreach { case (issueResp, (sqIdx, lqIdx), (issueTimer, deqPortIdx)) =>
-      val respInDatapath = if (!params.isVecMemIQ) resps(issueTimer(0))(deqPortIdx)
-                           else resps(issueTimer)(deqPortIdx)
-      val respAfterDatapath = Wire(chiselTypeOf(respInDatapath))
-      val hitRespsVec = VecInit(memEtyResps.map(x =>
-        x.valid &&
-        (if (params.needFeedBackSqIdx) x.bits.sqIdx.get === sqIdx else true.B) &&
-        (if (params.needFeedBackLqIdx) x.bits.lqIdx.get === lqIdx else true.B)
-      ).toSeq)
-      respAfterDatapath.valid := hitRespsVec.reduce(_ | _)
-      respAfterDatapath.bits  := (if (memEtyResps.size == 1) memEtyResps.head.bits
-                                  else Mux1H(hitRespsVec, memEtyResps.map(_.bits).toSeq))
-      issueResp := (if (!params.isVecMemIQ) Mux(issueTimer(1), respAfterDatapath, respInDatapath)
-                    else Mux(issueTimer === "b11".U, respAfterDatapath, respInDatapath))
-    }
-  }
-  else {
     issueRespVec.lazyZip(issueTimerVec.lazyZip(deqPortIdxReadVec)).foreach { case (issueResp, (issueTimer, deqPortIdx)) =>
       val Resp = resps(issueTimer)(deqPortIdx)
       issueResp := Resp
     }
-  }
 
   //deq
-  val enqEntryOldest          = Wire(Vec(params.numDeq, ValidIO(new EntryBundle)))
-  val simpEntryOldest         = OptionWrapper(params.hasCompAndSimp, Wire(Vec(params.numDeq, ValidIO(new EntryBundle))))
-  val compEntryOldest         = OptionWrapper(params.hasCompAndSimp, Wire(Vec(params.numDeq, ValidIO(new EntryBundle))))
-  val othersEntryOldest       = OptionWrapper(params.isAllComp || params.isAllSimp, Wire(Vec(params.numDeq, ValidIO(new EntryBundle))))
+  val enqEntryOldest          = Wire(Vec(params.numDeq, ValidIO(new EntryBundle(isDeq = true))))
+  val simpEntryOldest         = OptionWrapper(params.hasCompAndSimp, Wire(Vec(params.numDeq, ValidIO(new EntryBundle(isDeq = true)))))
+  val compEntryOldest         = OptionWrapper(params.hasCompAndSimp, Wire(Vec(params.numDeq, ValidIO(new EntryBundle(isDeq = true)))))
+  val othersEntryOldest       = OptionWrapper(params.isAllComp || params.isAllSimp, Wire(Vec(params.numDeq, ValidIO(new EntryBundle(isDeq = true)))))
+  val enqEntryOldestDelay     = Wire(Vec(params.numDeq, ValidIO(new EntryBundle(isDeq = true))))
+  val simpEntryOldestDelay    = OptionWrapper(params.hasCompAndSimp, Wire(Vec(params.numDeq, ValidIO(new EntryBundle(isDeq = true)))))
+  val compEntryOldestDelay    = OptionWrapper(params.hasCompAndSimp, Wire(Vec(params.numDeq, ValidIO(new EntryBundle(isDeq = true)))))
+  val othersEntryOldestDelay  = OptionWrapper(params.isAllComp || params.isAllSimp, Wire(Vec(params.numDeq, ValidIO(new EntryBundle(isDeq = true)))))
   val enqEntryOldestCancel    = Wire(Vec(params.numDeq, Bool()))
   val simpEntryOldestCancel   = OptionWrapper(params.hasCompAndSimp, Wire(Vec(params.numDeq, Bool())))
   val compEntryOldestCancel   = OptionWrapper(params.hasCompAndSimp, Wire(Vec(params.numDeq, Bool())))
@@ -309,11 +272,17 @@ class Entries(implicit p: Parameters, params: IssueBlockParams) extends XSModule
     enqEntryOldest(deqIdx) := Mux1H(sel.bits, entries.take(EnqEntryNum))
     enqEntryOldestCancel(deqIdx) := Mux1H(sel.bits, cancelBypassVec.take(EnqEntryNum))
   }
+  io.enqEntryOldestSelDelay.zipWithIndex.map { case (sel, deqIdx) =>
+    enqEntryOldestDelay(deqIdx) := Mux1H(sel.bits, entries.take(EnqEntryNum))
+  }
 
   if (params.isAllComp || params.isAllSimp) {
     io.othersEntryOldestSel.get.zipWithIndex.map { case (sel, deqIdx) =>
       othersEntryOldest.get(deqIdx) := Mux1H(sel.bits, entries.drop(EnqEntryNum))
       othersEntryOldestCancel.get(deqIdx) := Mux1H(sel.bits, cancelBypassVec.drop(EnqEntryNum))
+    }
+    io.othersEntryOldestSelDelay.get.zipWithIndex.map { case (sel, deqIdx) =>
+      othersEntryOldestDelay.get(deqIdx) := Mux1H(sel.bits, entries.drop(EnqEntryNum))
     }
   }
   else {
@@ -324,6 +293,12 @@ class Entries(implicit p: Parameters, params: IssueBlockParams) extends XSModule
     io.compEntryOldestSel.get.zipWithIndex.map { case (sel, deqIdx) =>
       compEntryOldest.get(deqIdx) := Mux1H(sel.bits, entries.drop(EnqEntryNum).takeRight(CompEntryNum))
       compEntryOldestCancel.get(deqIdx) := Mux1H(sel.bits, cancelBypassVec.drop(EnqEntryNum).takeRight(CompEntryNum))
+    }
+    io.simpEntryOldestSelDelay.get.zipWithIndex.map { case (sel, deqIdx) =>
+      simpEntryOldestDelay.get(deqIdx) := Mux1H(sel.bits, entries.drop(EnqEntryNum).take(SimpEntryNum))
+    }
+    io.compEntryOldestSelDelay.get.zipWithIndex.map { case (sel, deqIdx) =>
+      compEntryOldestDelay.get(deqIdx) := Mux1H(sel.bits, entries.drop(EnqEntryNum).takeRight(CompEntryNum))
     }
   }
 
@@ -375,6 +350,9 @@ class Entries(implicit p: Parameters, params: IssueBlockParams) extends XSModule
         io.deqEntry(i)     := Mux(sel.valid, othersEntryOldest.get(i), enqEntryOldest(i))
         io.cancelDeqVec(i) := Mux(sel.valid, othersEntryOldestCancel.get(i), enqEntryOldestCancel(i))
       }
+      io.othersEntryOldestSelDelay.get.zipWithIndex.foreach { case (sel, i) =>
+        io.deqOg1Payload(i) := Mux(sel.valid, othersEntryOldestDelay.get(i), enqEntryOldestDelay(i)).bits.toDeqOg1Payload(i)
+      }
     }
     else {
       io.compEntryOldestSel.get.zip(io.simpEntryOldestSel.get).zipWithIndex.foreach { case ((compSel, simpSel), i) =>
@@ -386,25 +364,12 @@ class Entries(implicit p: Parameters, params: IssueBlockParams) extends XSModule
                                Mux(simpSel.valid, simpEntryOldestCancel.get(i), enqEntryOldestCancel(i)))
         io.deqEntry(i)     := deqEntry
         io.cancelDeqVec(i) := cancelDeqVec
-        if (params.aluDeqNeedPickJump) {
-          val aluDeqSelectJump = io.deqEntry(0).valid && io.deqEntry(0).bits.payload.rfWen && FuType.isJump(io.deqEntry(0).bits.payload.fuType)
-          io.aluDeqSelectJump.get := aluDeqSelectJump
-          if (params.deqFuCfgs(i).contains(AluCfg)) {
-            assert(i == 0, "IQ needPickRfWen ALU must in deq 0")
-            // alu uop fuType change to alu
-            io.deqEntry(i).bits.status.fuType := Mux(aluDeqSelectJump, FuType.alu.U.asTypeOf(deqEntry.bits.status.fuType), deqEntry.bits.status.fuType)
-          }
-          else if (params.deqFuCfgs(i).contains(JmpCfg)) {
-            val deqEntry0 = Mux(io.compEntryOldestSel.get(0).valid,
-                                compEntryOldest.get(0),
-                                Mux(io.simpEntryOldestSel.get(0).valid, simpEntryOldest.get(0), enqEntryOldest(0)))
-            assert(i == 1, "IQ needPickRfWen BJU must in deq 1")
-            // jump uop use alu uop before change
-            io.deqEntry(i) := Mux(aluDeqSelectJump, deqEntry0, deqEntry)
-            dontTouch(io.deqEntry(i))
-            io.cancelDeqVec(i) := Mux(aluDeqSelectJump, io.cancelDeqVec(0), cancelDeqVec)
-          }
-        }
+      }
+      io.compEntryOldestSelDelay.get.zip(io.simpEntryOldestSelDelay.get).zipWithIndex.foreach { case ((compSel, simpSel), i) =>
+        val deqOg1Payload = Mux(compSel.valid,
+                           compEntryOldestDelay.get(i),
+                           Mux(simpSel.valid, simpEntryOldestDelay.get(i), enqEntryOldestDelay(i))).bits.toDeqOg1Payload(i)
+        io.deqOg1Payload(i) := deqOg1Payload
       }
     }
   }
@@ -415,7 +380,6 @@ class Entries(implicit p: Parameters, params: IssueBlockParams) extends XSModule
   io.srcReady                       := srcReadyVec.asUInt
   io.rfWen                          := rfWenVec.asUInt
   io.fuType                         := fuTypeVec
-  io.dataSources                    := dataSourceVec
   io.exuSources.foreach(_           := exuSourceVec.get)
   io.loadDependency                 := loadDependencyVec
   io.isFirstIssue.zipWithIndex.foreach{ case (isFirstIssue, deqIdx) =>
@@ -424,7 +388,12 @@ class Entries(implicit p: Parameters, params: IssueBlockParams) extends XSModule
   io.simpEntryEnqSelVec.foreach(_   := finalSimpTransSelVec.get.zip(enqEntryTransVec).map(x => x._1 & Fill(SimpEntryNum, x._2.valid)))
   io.compEntryEnqSelVec.foreach(_   := finalCompTransSelVec.get.zip(compEnqVec.get).map(x => x._1 & Fill(CompEntryNum, x._2.valid)))
   io.othersEntryEnqSelVec.foreach(_ := finalOthersTransSelVec.get.zip(enqEntryTransVec).map(x => x._1 & Fill(OthersEntryNum, x._2.valid)))
-  io.robIdx.foreach(_               := robIdxVec)
+  io.validRegNext                   := validVecRegNext.asUInt
+  io.issuedRegNext                  := issuedVecRegNext.asUInt
+  io.debugRobIdxVec.foreach(_       := robIdxVec)
+  io.debugCancelSourceVec.foreach(_ := debugCancelSourceVec.get)
+  io.debugSrcReadyVec.foreach(_     := debugSrcReadyVec.get)
+
 
 
   def EntriesConnect(in: CommonInBundle, out: CommonOutBundle, entryIdx: Int) = {
@@ -433,26 +402,19 @@ class Entries(implicit p: Parameters, params: IssueBlockParams) extends XSModule
     in.wakeUpFromIQ             := io.wakeUpFromIQ
     in.vlFromIntIsZero          := io.vlFromIntIsZero
     in.vlFromIntIsVlmax         := io.vlFromIntIsVlmax
-    in.vlFromVfIsZero           := io.vlFromVfIsZero
-    in.vlFromVfIsVlmax          := io.vlFromVfIsVlmax
     in.og0Cancel                := io.og0Cancel
     in.og1Cancel                := io.og1Cancel
     in.ldCancel                 := io.ldCancel
     in.deqSel                   := deqSelVec(entryIdx)
     in.deqPortIdxWrite          := deqPortIdxWriteVec(entryIdx)
     in.issueResp                := issueRespVec(entryIdx)
-    if (params.isVecMemIQ) {
-      in.fromLsq.get.sqDeqPtr   := io.vecMemIn.get.sqDeqPtr
-      in.fromLsq.get.lqDeqPtr   := io.vecMemIn.get.lqDeqPtr
-    }
     validVec(entryIdx)          := out.valid
     issuedVec(entryIdx)         := out.issued
     canIssueVec(entryIdx)       := out.canIssue
-    rfWenVec(entryIdx)          := out.entry.bits.payload.rfWen
+    rfWenVec(entryIdx)          := out.entry.bits.payload.rfWen.getOrElse(false.B)
     srcReadyVec(entryIdx)       := out.srcReady
     fuTypeVec(entryIdx)         := out.fuType
     robIdxVec(entryIdx)         := out.robIdx
-    dataSourceVec(entryIdx)     := out.dataSources
     isFirstIssueVec(entryIdx)   := out.isFirstIssue
     entries(entryIdx)           := out.entry
     deqPortIdxReadVec(entryIdx) := out.deqPortIdxRead
@@ -460,10 +422,7 @@ class Entries(implicit p: Parameters, params: IssueBlockParams) extends XSModule
     loadDependencyVec(entryIdx) := out.entry.bits.status.mergedLoadDependency
     cancelBypassVec(entryIdx)   := out.cancelBypass
     exuSourceVec.foreach(_(entryIdx) := out.exuSources.get)
-    if (params.needFeedBackSqIdx || params.needFeedBackLqIdx) {
-      sqIdxVec.get(entryIdx) := out.entry.bits.payload.sqIdx
-      lqIdxVec.get(entryIdx) := out.entry.bits.payload.lqIdx
-    }
+    lqIdxVec.foreach(_(entryIdx) := out.entry.bits.payload.og1Payload.lqIdx.get)
     entryInValidVec(entryIdx)       := out.entryInValid
     entryOutDeqValidVec(entryIdx)   := out.entryOutDeqValid
     entryOutTransValidVec(entryIdx) := out.entryOutTransValid
@@ -473,9 +432,15 @@ class Entries(implicit p: Parameters, params: IssueBlockParams) extends XSModule
       perfOg0CancelVec.get(entryIdx)  := out.perfOg0Cancel.get
       perfWakeupByIQVec.get(entryIdx) := out.perfWakeupByIQ.get
     }
+    debugCancelSourceVec.foreach { case cancelSourceVec =>
+      cancelSourceVec(entryIdx)       := out.debugCancelSource.get
+    }
+    debugSrcReadyVec.foreach { case srcReadyVec =>
+      srcReadyVec(entryIdx)     := out.debugSrcReady.get
+    }
+    validVecRegNext(entryIdx)   := out.validRegNext
+    issuedVecRegNext(entryIdx)  := out.issuedRegNext
   }
-
-  io.vecLdIn.foreach(dontTouch(_))
 
   // entries perf counter
   // enq
@@ -547,9 +512,13 @@ class EntriesIO(implicit p: Parameters, params: IssueBlockParams) extends XSBund
   val flush               = Flipped(ValidIO(new Redirect))
   //enq
   val enq                 = Vec(params.numEnq, Flipped(ValidIO(new EntryBundle)))
-  val og0Resp             = Vec(params.numDeq, Flipped(ValidIO(new EntryDeqRespBundle)))
-  val og1Resp             = Vec(params.numDeq, Flipped(ValidIO(new EntryDeqRespBundle)))
-  val og2Resp             = OptionWrapper(params.needOg2Resp, Vec(params.numDeq, Flipped(ValidIO(new EntryDeqRespBundle))))
+  val og0Resp             = Vec(params.numDeq, Flipped(new IssueQueueRespBundle))
+  val og1Resp             = Vec(params.numDeq, Flipped(new IssueQueueRespBundle))
+  val og2Resp             = OptionWrapper(params.needOg2Resp, Vec(params.numDeq, Flipped(new IssueQueueRespBundle)))
+  val s0Resp              = OptionWrapper(params.needS0Resp, Vec(params.numDeq, Flipped(new IssueQueueRespBundle)))
+  val s1Resp              = OptionWrapper(params.needS1Resp, Vec(params.numDeq, Flipped(new IssueQueueRespBundle)))
+  val s2Resp              = OptionWrapper(params.needS2Resp, Vec(params.numDeq, Flipped(new IssueQueueRespBundle)))
+  val snResp              = OptionWrapper(params.needSnResp, Vec(params.numDeq, Flipped(new IssueQueueRespBundle)))
   //deq sel
   val deqReady            = Vec(params.numDeq, Input(Bool()))
   val deqSelOH            = Vec(params.numDeq, Flipped(ValidIO(UInt(params.numEntries.W))))
@@ -557,6 +526,10 @@ class EntriesIO(implicit p: Parameters, params: IssueBlockParams) extends XSBund
   val simpEntryOldestSel  = OptionWrapper(params.hasCompAndSimp, Vec(params.numDeq, Flipped(ValidIO(UInt(params.numSimp.W)))))
   val compEntryOldestSel  = OptionWrapper(params.hasCompAndSimp, Vec(params.numDeq, Flipped(ValidIO(UInt(params.numComp.W)))))
   val othersEntryOldestSel= OptionWrapper(params.isAllComp || params.isAllSimp, Vec(params.numDeq, Flipped(ValidIO(UInt((params.numEntries - params.numEnq).W)))))
+  val enqEntryOldestSelDelay    = Vec(params.numDeq, Flipped(ValidIO(UInt(params.numEnq.W))))
+  val simpEntryOldestSelDelay   = OptionWrapper(params.hasCompAndSimp, Vec(params.numDeq, Flipped(ValidIO(UInt(params.numSimp.W)))))
+  val compEntryOldestSelDelay   = OptionWrapper(params.hasCompAndSimp, Vec(params.numDeq, Flipped(ValidIO(UInt(params.numComp.W)))))
+  val othersEntryOldestSelDelay = OptionWrapper(params.isAllComp || params.isAllSimp, Vec(params.numDeq, Flipped(ValidIO(UInt((params.numEntries - params.numEnq).W)))))
   val subDeqRequest       = OptionWrapper(params.deqFuSame, Vec(params.numDeq, Input(UInt(params.numEntries.W))))
   val subDeqSelOH         = OptionWrapper(params.deqFuSame, Vec(params.numDeq, Input(UInt(params.numEntries.W))))
   // wakeup
@@ -566,8 +539,6 @@ class EntriesIO(implicit p: Parameters, params: IssueBlockParams) extends XSBund
   val wakeUpFromIQDelayed: MixedVec[ValidIO[IssueQueueIQWakeUpBundle]] = Flipped(params.genIQWakeUpSinkValidBundle)
   val vlFromIntIsZero     = Input(Bool())
   val vlFromIntIsVlmax    = Input(Bool())
-  val vlFromVfIsZero      = Input(Bool())
-  val vlFromVfIsVlmax     = Input(Bool())
   val og0Cancel           = Input(ExuVec())
   val og1Cancel           = Input(ExuVec())
   val ldCancel            = Vec(backendParams.LdExuCnt, Flipped(new LoadCancelIO))
@@ -578,41 +549,27 @@ class EntriesIO(implicit p: Parameters, params: IssueBlockParams) extends XSBund
   val rfWen               = Output(UInt(params.numEntries.W))
   val srcReady            = Output(UInt(params.numEntries.W))
   val fuType              = Vec(params.numEntries, Output(FuType()))
-  val dataSources         = Vec(params.numEntries, Vec(params.numRegSrc, Output(DataSource())))
   val loadDependency      = Vec(params.numEntries, Vec(LoadPipelineWidth, UInt(LoadDependencyWidth.W)))
   val exuSources          = OptionWrapper(params.hasIQWakeUp, Vec(params.numEntries, Vec(params.numRegSrc, Output(ExuSource()))))
+  // for enq.ready timing
+  val validRegNext        = Output(UInt(params.numEntries.W))
+  val issuedRegNext       = Output(UInt(params.numEntries.W))
   //deq status
   val isFirstIssue        = Vec(params.numDeq, Output(Bool()))
-  val deqEntry            = Vec(params.numDeq, ValidIO(new EntryBundle))
+  val deqEntry            = Vec(params.numDeq, ValidIO(new EntryBundle(isDeq = true)))
+  val deqOg1Payload       = Output(MixedVec(params.exuBlockParams.map(x => new IssueQueueDeqOg1Payload(x))))
   val cancelDeqVec        = Vec(params.numDeq, Output(Bool()))
-  val aluDeqSelectJump    = Option.when(params.aluDeqNeedPickJump)(Output(Bool()))
-
-  // load/hybird only
-  val fromLoad = OptionWrapper(params.isLdAddrIQ || params.isHyAddrIQ, new Bundle {
-    val finalIssueResp    = Vec(params.numDeq, Flipped(ValidIO(new EntryDeqRespBundle)))
-    val memAddrIssueResp  = Vec(params.numDeq, Flipped(ValidIO(new EntryDeqRespBundle)))
-  })
-  // mem only
-  val fromMem = OptionWrapper(params.isMemAddrIQ, new Bundle {
-    val slowResp          = Vec(params.numDeq, Flipped(ValidIO(new EntryDeqRespBundle)))
-    val fastResp          = Vec(params.numDeq, Flipped(ValidIO(new EntryDeqRespBundle)))
-  })
-  // vec mem only
-  val vecMemIn = OptionWrapper(params.isVecMemIQ, new Bundle {
-    val sqDeqPtr          = Input(new SqPtr)
-    val lqDeqPtr          = Input(new LqPtr)
-  })
-  val vecLdIn = OptionWrapper(params.isVecLduIQ, new Bundle {
-    val finalIssueResp = Vec(params.numDeq, Flipped(ValidIO(new EntryDeqRespBundle)))
-    val resp              = Vec(params.numDeq, Flipped(ValidIO(new EntryDeqRespBundle)))
-  })
-  val robIdx = OptionWrapper(params.isVecMemIQ, Output(Vec(params.numEntries, new RobPtr)))
 
   // trans
   val simpEntryDeqSelVec = OptionWrapper(params.hasCompAndSimp, Vec(params.numEnq, Input(UInt(params.numSimp.W))))
   val simpEntryEnqSelVec = OptionWrapper(params.hasCompAndSimp, Vec(params.numEnq, Output(UInt(params.numSimp.W))))
   val compEntryEnqSelVec = OptionWrapper(params.hasCompAndSimp, Vec(params.numEnq, Output(UInt(params.numComp.W))))
   val othersEntryEnqSelVec = OptionWrapper(params.isAllComp || params.isAllSimp, Vec(params.numEnq, Output(UInt((params.numEntries - params.numEnq).W))))
+
+  // todpown
+  val debugRobIdxVec = Option.when(backendParams.debugEn)(Output(Vec(params.numEntries, new RobPtr)))
+  val debugCancelSourceVec = Option.when(backendParams.debugEn)(Output(Vec(params.numEntries, IQCancelSource())))
+  val debugSrcReadyVec = Option.when(backendParams.debugEn)(Output(Vec(params.numEntries, Bool())))
 
   def wakeup = wakeUpFromWB ++ wakeUpFromIQ
 }

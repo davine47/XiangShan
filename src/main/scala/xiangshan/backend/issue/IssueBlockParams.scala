@@ -6,18 +6,19 @@ import chisel3.util._
 import utils.SeqUtils
 import xiangshan.backend.BackendParams
 import xiangshan.backend.Bundles._
-import xiangshan.backend.datapath.DataConfig.DataConfig
+import xiangshan.backend.datapath.DataConfig.{DataConfig, FpData, IntData, V0Data, VecData, VlData}
 import xiangshan.backend.datapath.WbConfig._
 import xiangshan.backend.datapath.{WakeUpConfig, WakeUpSource}
 import xiangshan.backend.exu.ExeUnitParams
 import xiangshan.backend.fu.{FuConfig, FuType}
 import xiangshan.SelImm
-import xiangshan.backend.issue.EntryBundles.EntryDeqRespBundle
+import xiangshan.backend.decode.Imm
+import xiangshan.backend.issue.EntryBundles.IssueQueueRespBundle
 import xiangshan.backend.fu.FuConfig._
 
 case class IssueBlockParams(
   // top down
-  private val exuParams: Seq[ExeUnitParams],
+  val exuParams: Seq[ExeUnitParams],
   val numEntries       : Int,
   numEnq               : Int,
   numComp              : Int,
@@ -48,25 +49,28 @@ case class IssueBlockParams(
 
   def inVfSchd: Boolean = schdType == VecScheduler()
 
-  def isMemAddrIQ: Boolean = LduCnt > 0 || StaCnt > 0 || VlduCnt > 0 || VstuCnt > 0 || HyuCnt > 0
+  def isMemAddrIQ: Boolean = LduCnt > 0 || StaCnt > 0 || HyuCnt > 0
 
-  def isMemBlockIQ: Boolean = LduCnt > 0 || StaCnt > 0 || StdCnt > 0 || VlduCnt > 0 || VstuCnt > 0 || HyuCnt > 0
+  def isMemBlockIQ: Boolean = LduCnt > 0 || StaCnt > 0 || StdCnt > 0 || HyuCnt > 0 || VStdCnt > 0
 
   def isLdAddrIQ: Boolean = LduCnt > 0
 
   def isStAddrIQ: Boolean = StaCnt > 0
 
+  def isStdIQ: Boolean = StdCnt > 0
+
+  def isStoreIQ: Boolean = isStAddrIQ || isStdIQ
+
   def isHyAddrIQ: Boolean = HyuCnt > 0
 
-  def isVecLduIQ: Boolean = (VlduCnt + VseglduCnt) > 0
+  def isVecStdIQ: Boolean = VStdCnt > 0
 
-  def isVecStuIQ: Boolean = (VstuCnt + VsegstuCnt) > 0
+  def needLqIdx: Boolean = isLdAddrIQ
 
-  def isVecMemIQ: Boolean = isVecLduIQ || isVecStuIQ
+  def needSqIdx: Boolean = isStAddrIQ || isStdIQ || isLdAddrIQ || isVecStdIQ
 
-  def needFeedBackSqIdx: Boolean = isVecMemIQ || isStAddrIQ
-
-  def needFeedBackLqIdx: Boolean = isVecMemIQ || isLdAddrIQ
+  // There is no snresp for load, so there is no need to provide feedback on lqidx
+  def needFeedBackLqIdx: Boolean = isLdAddrIQ
 
   def needLoadDependency: Boolean = exuBlockParams.map(_.needLoadDependency).reduce(_ || _)
 
@@ -124,18 +128,26 @@ case class IssueBlockParams(
 
   def needExceptionGen: Boolean = exceptionOut.nonEmpty || flushPipe || replayInst || trigger
 
-  def needPc: Boolean = JmpCnt + BrhCnt + FenceCnt > 0
+  def needPc: Boolean = exuBlockParams.map(_.needPc).reduce(_ || _)
 
-  def needRasAction: Boolean = JmpCnt > 0
+  def needPcRdPortNum: Int = exuBlockParams.map(_.needPc).count(_ == true)
 
-  def needIsRVC: Boolean = JmpCnt + BrhCnt + CsrCnt + LduCnt > 0
+  def needRasAction: Boolean = exuBlockParams.map(_.hasRasAction).reduce(_ || _)
+
+  def needIsRVC: Boolean = exuBlockParams.map(_.needIsRVC).reduce(_ || _)
+
+  def needTaken: Boolean = JmpCnt + BrhCnt > 0
+
+  def needFtqPtr: Boolean = exuBlockParams.map(_.needFtqPtr).reduce(_ || _)
+
+  def needFtqPtrOffset: Boolean = exuBlockParams.map(_.needFtqPtrOffset).reduce(_ || _)
 
   def needSrcFrm: Boolean = exuBlockParams.map(_.needSrcFrm).reduce(_ || _)
 
   def needSrcVxrm: Boolean = exuBlockParams.map(_.needSrcVxrm).reduce(_ || _)
 
-  def writeVConfig: Boolean = exuBlockParams.map(_.writeVConfig).reduce(_ || _)
-  
+  def writeVConfig: Boolean = exuBlockParams.map(_.writeVlRf).reduce(_ || _)
+
   def writeVType: Boolean = exuBlockParams.map(_.writeVType).reduce(_ || _)
 
   def numWriteIntRf: Int = exuBlockParams.count(_.writeIntRf)
@@ -162,6 +174,8 @@ case class IssueBlockParams(
 
   def JmpCnt: Int = exuBlockParams.map(_.fuConfigs.count(_.fuType == FuType.jmp)).sum
 
+  def LinkCnt: Int = exuBlockParams.map(_.fuConfigs.count(_.fuType == FuType.link)).sum
+
   def BrhCnt: Int = exuBlockParams.map(_.fuConfigs.count(_.fuType == FuType.brh)).sum
 
   def I2fCnt: Int = exuBlockParams.map(_.fuConfigs.count(_.fuType == FuType.i2f)).sum
@@ -178,9 +192,7 @@ case class IssueBlockParams(
 
   def BkuCnt: Int = exuBlockParams.map(_.fuConfigs.count(_.fuType == FuType.bku)).sum
 
-  def VsetCnt: Int = exuBlockParams.map(_.fuConfigs.count(x => x.fuType == FuType.vsetiwi || x.fuType == FuType.vsetiwf || x.fuType == FuType.vsetfwf)).sum
-
-  def FmacCnt: Int = exuBlockParams.map(_.fuConfigs.count(_.fuType == FuType.fmac)).sum
+  def VsetCnt: Int = exuBlockParams.map(_.fuConfigs.count(x => x.fuType == FuType.vset)).sum
 
   def fDivSqrtCnt: Int = exuBlockParams.map(_.fuConfigs.count(_.fuType == FuType.fDivSqrt)).sum
 
@@ -192,19 +204,11 @@ case class IssueBlockParams(
 
   def StdCnt: Int = exuBlockParams.map(_.fuConfigs.count(_.name == "std")).sum
 
+  def VStdCnt: Int = exuBlockParams.map(_.fuConfigs.count(_.name == "vstd")).sum
+
   def HyuCnt: Int = exuBlockParams.count(_.hasHyldaFu) // only count hylda, since it equals to hysta
 
   def LdExuCnt = LduCnt + HyuCnt
-
-  def VipuCnt: Int = exuBlockParams.map(_.fuConfigs.count(_.fuType == FuType.vipu)).sum
-
-  def VlduCnt: Int = exuBlockParams.map(_.fuConfigs.count(_.fuType == FuType.vldu)).sum
-
-  def VstuCnt: Int = exuBlockParams.map(_.fuConfigs.count(_.fuType == FuType.vstu)).sum
-
-  def VseglduCnt: Int = exuBlockParams.map(_.fuConfigs.count(_.fuType == FuType.vsegldu)).sum
-
-  def VsegstuCnt: Int = exuBlockParams.map(_.fuConfigs.count(_.fuType == FuType.vsegstu)).sum
 
   def numRedirect: Int = exuBlockParams.count(_.hasRedirect)
 
@@ -218,17 +222,35 @@ case class IssueBlockParams(
 
   def needReadFpRegFile: Boolean = exuBlockParams.map(_.readFpRf).reduce(_ || _)
 
-  def needWriteIntRegFile: Boolean = exuBlockParams.map(_.writeIntRf).reduce(_ || _)
+  def needIntWen: Boolean = exuBlockParams.map(_.needIntWen).reduce(_ || _)
 
-  def needWriteFpRegFile: Boolean = exuBlockParams.map(_.writeFpRf).reduce(_ || _)
+  def needFpWen: Boolean = exuBlockParams.map(_.needFpWen).reduce(_ || _)
 
-  def needWriteVecRegFile: Boolean = exuBlockParams.map(_.writeVecRf).reduce(_ || _)
+  def needVecWen: Boolean = exuBlockParams.map(_.needVecWen).reduce(_ || _)
 
-  def needWriteV0RegFile: Boolean = exuBlockParams.map(_.writeV0Rf).reduce(_ || _)
+  def needV0Wen: Boolean = exuBlockParams.map(_.needV0Wen).reduce(_ || _)
 
-  def needWriteVlRegFile: Boolean = exuBlockParams.map(_.writeVlRf).reduce(_ || _)
+  def needVlWen: Boolean = exuBlockParams.map(_.needVlWen).reduce(_ || _)
+
+  def writeVxsat: Boolean = exuBlockParams.map(_.writeVxsat).reduce(_ || _)
 
   def needOg2Resp: Boolean = exuBlockParams.map(_.needOg2).reduce(_ || _)
+
+  def needS0Resp = this.isStAddrIQ || this.isStdIQ
+
+  def needFakeS1Resp = this.isStAddrIQ
+
+  def needS1Resp = this.isStdIQ
+
+  def needS2Resp = this.isStAddrIQ
+
+  def needSnResp = this.isLdAddrIQ
+
+  // TODO needOg0Resp needOg1Resp
+  def issueTimerMaxValue: Int = 1 + Seq(needOg2Resp, needS0Resp, (needFakeS1Resp || needS1Resp), needS2Resp, needSnResp).count(_ == true)
+
+  def issueTimerWidth = issueTimerMaxValue.U.getWidth
+
 
   def needUncertainWakeupFromExu: Boolean = exuBlockParams.map(_.fuConfigs).flatten.map(x => FuConfig.needUncertainWakeupFuConfigs.contains(x)).reduce(_ || _)
 
@@ -315,7 +337,7 @@ case class IssueBlockParams(
 
   def needWakeupFromV0WBPort = backendParam.allExuParams.filter(x => !wakeUpInExuSources.map(_.name).contains(x.name) && this.readV0Rf).groupBy(x => x.getV0WBPort.getOrElse(V0WB(port = -1)).port).filter(_._1 != -1)
 
-  def needWakeupFromVlWBPort = backendParam.allExuParams.filter(x => !wakeUpInExuSources.map(_.name).contains(x.name) && this.readVlRf).groupBy(x => x.getVlWBPort.getOrElse(VlWB(port = -1)).port).filter(_._1 != -1)
+  def needWakeupFromVlWBPort = backendParam.allExuParams.filter(x => this.readVlRf).groupBy(x => x.getVlWBPort.getOrElse(VlWB(port = -1)).port).filter(_._1 != -1)
 
   def hasWakeupFromMem: Boolean = backendParam.allExuParams.filter(x => wakeUpInExuSources.map(_.name).contains(x.name)).map(_.isMemExeUnit).fold(false)(_ | _)
 
@@ -325,18 +347,16 @@ case class IssueBlockParams(
 
   def deqFuCfgs: Seq[Seq[FuConfig]] = exuBlockParams.map(_.fuConfigs)
 
-  def aluDeqNeedPickJump = (deqFuCfgs.size == 2) && deqFuCfgs.flatten.contains(AluCfg) && deqFuCfgs.flatten.contains(JmpCfg)
-
   def deqFuInterSect: Seq[FuConfig] = if (numDeq == 2) deqFuCfgs(0).intersect(deqFuCfgs(1)) else Seq()
 
   def deqFuSame: Boolean = (numDeq == 2) && deqFuInterSect.length == deqFuCfgs(0).length && deqFuCfgs(0).length == deqFuCfgs(1).length
 
   def deqFuDiff: Boolean = (numDeq == 2) && deqFuInterSect.length == 0
 
-  def deqImmTypes: Seq[UInt] = getFuCfgs.flatMap(_.immType).distinct
+  def deqImmTypes: Seq[Imm] = getFuCfgs.flatMap(_.immType).distinct
 
   // set load imm to 32-bit for fused_lui_load
-  def deqImmTypesMaxLen: Int = if (isLdAddrIQ || isHyAddrIQ) 32 else deqImmTypes.map(SelImm.getImmUnion(_)).maxBy(_.len).len
+  def deqImmTypesMaxLen: Int = if (isLdAddrIQ || isHyAddrIQ) 32 else deqImmTypes.map(x => x).maxBy(_.len).len
 
   def needImm: Boolean = deqImmTypes.nonEmpty
 
@@ -362,64 +382,138 @@ case class IssueBlockParams(
     wakeUpInExuSources.map(x => backendParam.getExuIdx(x.name))
   }
 
+  def genOg1InUopDecoupledBundle(implicit p: Parameters): MixedVec[DecoupledIO[Og1InUop]] = {
+    MixedVec(this.exuBlockParams.map(x => DecoupledIO(new Og1InUop(this, x))))
+  }
+
   def genExuInputDecoupledBundle(implicit p: Parameters): MixedVec[DecoupledIO[ExuInput]] = {
     MixedVec(this.exuBlockParams.map(x => DecoupledIO(x.genExuInputBundle)))
   }
 
-  def genExuInputDecoupledCopySrcBundle(implicit p: Parameters): MixedVec[DecoupledIO[ExuInput]] = {
-    MixedVec(this.exuBlockParams.map(x => DecoupledIO(x.genExuInputCopySrcBundle)))
+  def genNewExuInputDecoupledBundle(implicit p: Parameters): MixedVec[DecoupledIO[NewExuInput]] = {
+    MixedVec(this.exuBlockParams.map(x => DecoupledIO(x.genNewExuInputBundle)))
+  }
+
+  def genMemWakeupLRQBundle(implicit p: Parameters): MixedVec[ValidIO[IssueQueueLRQWakeUpBundle]] = {
+    MixedVec(this.exuBlockParams.filter(_.hasStoreFu).map(x => ValidIO(new IssueQueueLRQWakeUpBundle)))
+  }
+
+  def genMemWakeupCancelBundle(implicit p: Parameters): MixedVec[IssueQueueLRQWakeUpCancelBundle] = {
+    MixedVec(this.exuBlockParams.filter(_.hasStoreFu).map(x => new IssueQueueLRQWakeUpCancelBundle))
   }
 
   def genExuOutputDecoupledBundle(implicit p: Parameters): MixedVec[DecoupledIO[ExuOutput]] = {
     MixedVec(this.exuParams.map(x => DecoupledIO(x.genExuOutputBundle)))
   }
 
+  def genNewExuOutputDecoupledBundle(implicit p: Parameters): MixedVec[DecoupledIO[NewExuOutput]] = {
+    MixedVec(this.exuParams.map(x => DecoupledIO(x.genNewExuOutputBundle)))
+  }
+
+  def genMemWriteBackBundle(implicit p: Parameters): MixedVec[MemWriteBack] = {
+    MixedVec(this.exuParams.map(x => x.genMemWriteBackBundle))
+  }
+
   def genExuOutputValidBundle(implicit p: Parameters): MixedVec[ValidIO[ExuOutput]] = {
     MixedVec(this.exuParams.map(x => ValidIO(x.genExuOutputBundle)))
+  }
+
+  def genNewExuOutputBundle[
+    T <: Bundle
+  ](builder: NewExuOutput => T)(implicit p: Parameters) = {
+    MixedVec(this.exuParams.map(x => builder(x.genNewExuOutputBundle)))
+  }
+
+
+  def genNewExuOutputValidBundle(implicit p: Parameters): MixedVec[ValidIO[NewExuOutput]] = {
+    MixedVec(this.exuParams.map(x => ValidIO(x.genNewExuOutputBundle)))
+  }
+
+  def getWriteBackRobParams(needExtraVld: Boolean): Seq[ExeUnitParams] = {
+    this.exuParams.flatMap(
+      x =>
+        if (x.hasLoadExu && x.writeIntRf && x.writeVfRf && needExtraVld)
+          Seq.fill(2)(x)
+        else
+          Seq(x)
+    )
+  }
+
+  def genWriteBackRobValidBundle(needExtraVld: Boolean)(implicit p: Parameters): MixedVec[ValidIO[WriteBackRobBundle]] = {
+    MixedVec(
+      this.exuParams.flatMap(
+        x =>
+          if (x.hasLoadExu && x.writeIntRf && x.writeVfRf && needExtraVld)
+            Seq.fill(2)(ValidIO(x.genWriteBackRobBundle))
+          else
+            Seq(ValidIO(x.genWriteBackRobBundle))
+      )
+    )
   }
 
   def genExuBypassValidBundle(implicit p: Parameters): MixedVec[ValidIO[ExuBypassBundle]] = {
     MixedVec(this.exuParams.filterNot(_.fakeUnit).map(x => ValidIO(x.genExuBypassBundle)))
   }
 
-  def genIssueDecoupledBundle(implicit p: Parameters): MixedVec[DecoupledIO[IssueQueueIssueBundle]] = {
-    MixedVec(exuBlockParams.filterNot(_.fakeUnit).map(x => DecoupledIO(new IssueQueueIssueBundle(this, x))))
+  def genIssueDecoupledBundle(implicit p: Parameters): MixedVec[DecoupledIO[Og0InUop]] = {
+    MixedVec(exuBlockParams.filterNot(_.fakeUnit).map(x => DecoupledIO(new Og0InUop(this, x))))
   }
 
-  def genIssueValidBundle(implicit p: Parameters): MixedVec[ValidIO[IssueQueueIssueBundle]] = {
-    MixedVec(exuBlockParams.filterNot(_.fakeUnit).map(x => ValidIO(new IssueQueueIssueBundle(this, x))))
+  def genIssueValidBundle(implicit p: Parameters): MixedVec[ValidIO[Og0InUop]] = {
+    MixedVec(exuBlockParams.filterNot(_.fakeUnit).map(x => ValidIO(new Og0InUop(this, x))))
+  }
+
+  def genIssueDeqOg1PayloadBundle(implicit p: Parameters): MixedVec[IssueQueueDeqOg1Payload] = {
+    MixedVec(exuBlockParams.filterNot(_.fakeUnit).map(x => new IssueQueueDeqOg1Payload(x)))
+  }
+
+  def genExuWakeUpOutValidBundle(implicit p: Parameters): MixedVec[DecoupledIO[IssueQueueIQWakeUpBundle]] = {
+    val uncertainExuParams = this.allExuParams.filter(_.needUncertainWakeup)
+    MixedVec(uncertainExuParams.map(param => {
+      val isCopyPdest = param.copyWakeupOut
+      val copyNum = param.copyNum
+      DecoupledIO(new IssueQueueIQWakeUpBundle(backendParam.getExuIdx(param.name), backendParam, isCopyPdest, copyNum))
+    }))
   }
 
   def genWBWakeUpSinkValidBundle(implicit p: Parameters): MixedVec[ValidIO[IssueQueueWBWakeUpBundle]] = {
     val intBundle: Seq[ValidIO[IssueQueueWBWakeUpBundle]] = schdType match {
-      case IntScheduler() => needWakeupFromIntWBPort.map(x => ValidIO(new IssueQueueWBWakeUpBundle(x._2.map(_.exuIdx), backendParam))).toSeq
+      case IntScheduler() => needWakeupFromIntWBPort.map(x => ValidIO(new IssueQueueWBWakeUpBundle(x._2.map(_.exuIdx), backendParam, IntData()))).toSeq
       case _ => Seq()
     }
     val fpBundle = schdType match {
-      case FpScheduler() => needWakeupFromFpWBPort.map(x => ValidIO(new IssueQueueWBWakeUpBundle(x._2.map(_.exuIdx), backendParam))).toSeq
+      case FpScheduler() => needWakeupFromFpWBPort.map(x => ValidIO(new IssueQueueWBWakeUpBundle(x._2.map(_.exuIdx), backendParam, FpData()))).toSeq
       case _ => Seq()
     }
     val vfBundle = schdType match {
-      case VecScheduler() => needWakeupFromVfWBPort.map(x => ValidIO(new IssueQueueWBWakeUpBundle(x._2.map(_.exuIdx), backendParam))).toSeq
+      case VecScheduler() => needWakeupFromVfWBPort.map(x => ValidIO(new IssueQueueWBWakeUpBundle(x._2.map(_.exuIdx), backendParam, VecData()))).toSeq
       case _ => Seq()
     }
     val v0Bundle = schdType match {
-      case VecScheduler() => needWakeupFromV0WBPort.map(x => ValidIO(new IssueQueueWBWakeUpBundle(x._2.map(_.exuIdx), backendParam))).toSeq
+      case VecScheduler() => needWakeupFromV0WBPort.map(x => ValidIO(new IssueQueueWBWakeUpBundle(x._2.map(_.exuIdx), backendParam, V0Data()))).toSeq
       case _ => Seq()
     }
     val vlBundle = schdType match {
-      case VecScheduler() => needWakeupFromVlWBPort.map(x => ValidIO(new IssueQueueWBWakeUpBundle(x._2.map(_.exuIdx), backendParam))).toSeq
+      case IntScheduler() | VecScheduler() => needWakeupFromVlWBPort.map(x => ValidIO(new IssueQueueWBWakeUpBundle(x._2.map(_.exuIdx), backendParam, VlData()))).toSeq
       case _ => Seq()
     }
     MixedVec(intBundle ++ fpBundle ++ vfBundle ++ v0Bundle ++ vlBundle)
   }
 
   def genIQWakeUpSourceValidBundle(implicit p: Parameters): MixedVec[ValidIO[IssueQueueIQWakeUpBundle]] = {
-    MixedVec(exuBlockParams.map(x => ValidIO(new IssueQueueIQWakeUpBundle(x.exuIdx, backendParam, x.copyWakeupOut, x.copyNum))))
+    MixedVec(exuBlockParams.filter(_.isIQWakeUpSource).map(x => ValidIO(new IssueQueueIQWakeUpBundle(x.exuIdx, backendParam, x.copyWakeupOut, x.copyNum))))
   }
 
   def genIQWakeUpSinkValidBundle(implicit p: Parameters): MixedVec[ValidIO[IssueQueueIQWakeUpBundle]] = {
     MixedVec(this.wakeUpInExuSources.map(x => ValidIO(new IssueQueueIQWakeUpBundle(backendParam.getExuIdx(x.name), backendParam))))
+  }
+
+  def genIOWakeUpLRQValidBundle(implicit p: Parameters): MixedVec[ValidIO[IssueQueueLRQWakeUpBundle]] = {
+    MixedVec(exuBlockParams.filter(_.hasStoreFu).map(x => ValidIO(new IssueQueueLRQWakeUpBundle)))
+  }
+
+  def genIOWakeUpCancelBundle(implicit p: Parameters): MixedVec[IssueQueueLRQWakeUpCancelBundle] = {
+    MixedVec(exuBlockParams.filter(_.hasStoreFu).map(x => Output(new IssueQueueLRQWakeUpCancelBundle)))
   }
 
   def genOGRespBundle(implicit p: Parameters) = {
@@ -429,7 +523,7 @@ case class IssueBlockParams(
 
   def genOG2RespBundle(implicit p: Parameters) = {
     implicit val issueBlockParams = this
-    MixedVec(exuBlockParams.map(_ => new Valid(new EntryDeqRespBundle)))
+    MixedVec(exuBlockParams.map(_ => new IssueQueueRespBundle))
   }
 
   def genWbFuBusyTableWriteBundle(implicit p: Parameters) = {

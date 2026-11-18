@@ -18,14 +18,23 @@ package xiangshan.frontend.bpu.mbtb
 import chisel3._
 import chisel3.util._
 import org.chipsalliance.cde.config.Parameters
+import xiangshan.XSCoreParamsKey
+import xiangshan.frontend.Pc
 import xiangshan.frontend.bpu.BranchAttribute
 import xiangshan.frontend.bpu.BranchInfo
+import xiangshan.frontend.bpu.SaturateCounter
+import xiangshan.frontend.bpu.SaturateCounterFactory
 import xiangshan.frontend.bpu.TargetCarry
 import xiangshan.frontend.bpu.WriteReqBundle
 
+object TakenCounter extends SaturateCounterFactory {
+  def width(implicit p: Parameters): Int =
+    p(XSCoreParamsKey).frontendParameters.bpuParameters.mbtbParameters.TakenCntWidth
+}
+
 class MainBtbEntry(implicit p: Parameters) extends MainBtbBundle {
   // whether the entry is valid
-  val valid: Bool = Bool()
+  def valid: Bool = !attribute.isNone
 
   val tag:       UInt            = UInt(TagWidth.W)
   val attribute: BranchAttribute = new BranchAttribute
@@ -38,27 +47,72 @@ class MainBtbEntry(implicit p: Parameters) extends MainBtbBundle {
   // Relative position to the aligned start addr
   val position: UInt = UInt(CfiAlignedPositionWidth.W)
 
-  //  Branch target info
-  val targetCarry:     TargetCarry = new TargetCarry
-  val targetLowerBits: UInt        = UInt(TargetWidth.W)
+  // Branch target info
+  val targetCarry:     Option[TargetCarry] = Option.when(EnableTargetFix)(new TargetCarry)
+  val targetLowerBits: UInt                = UInt(TargetWidth.W)
 
 //  val replaceCnt: UInt = UInt(2.W) // TODO: not used for now
 }
 
-class MainBtbSramWriteReq(implicit p: Parameters) extends WriteReqBundle with HasMainBtbParameters {
+class MainBtbEntrySramWriteReq(implicit p: Parameters) extends WriteReqBundle with HasMainBtbParameters {
+  val hit:          Bool         = Bool()
   val setIdx:       UInt         = UInt(SetIdxLen.W)
   val entry:        MainBtbEntry = new MainBtbEntry
   override def tag: Option[UInt] = Some(Cat(entry.tag, entry.position)) // use entry's tag directly
+  override def compareBits: Option[UInt] = {
+    val base = Cat(entry.attribute.asUInt, entry.targetLowerBits)
+    Some(entry.targetCarry.map(carry => Cat(base, carry.value)).getOrElse(base))
+  }
+}
+
+class MainBtbCounterSramWriteReq(implicit p: Parameters) extends MainBtbBundle {
+  val setIdx:   UInt                 = UInt(SetIdxLen.W)
+  val wayMask:  UInt                 = UInt(NumWay.W)
+  val counters: Vec[SaturateCounter] = Vec(NumWay, TakenCounter())
+}
+
+class MainBtbSnapshotResp(implicit p: Parameters) extends MainBtbBundle {
+  val setIdx:   UInt         = UInt(SetIdxLen.W)
+  val evicted:  MainBtbEntry = new MainBtbEntry
+  val incoming: MainBtbEntry = new MainBtbEntry
 }
 
 class MainBtbMetaEntry(implicit p: Parameters) extends MainBtbBundle {
   val rawHit:    Bool            = Bool()
   val position:  UInt            = UInt(CfiPositionWidth.W)
   val attribute: BranchAttribute = new BranchAttribute
+  val counter:   SaturateCounter = TakenCounter()
 
   def hit(branch: BranchInfo): Bool = rawHit && position === branch.cfiPosition
 }
 
 class MainBtbMeta(implicit p: Parameters) extends MainBtbBundle {
-  val entries: Vec[Vec[MainBtbMetaEntry]] = Vec(NumAlignBanks, Vec(NumWay, new MainBtbMetaEntry))
+  val entries: Vec[Vec[MainBtbMetaEntry]] = Vec(NumAlignBanks, Vec(NumWay + 1, new MainBtbMetaEntry))
+}
+
+class MainBtbAlignBankTrace(implicit p: Parameters) extends MainBtbBundle {
+  val needWrite: Bool         = Bool()
+  val setIdx:    UInt         = UInt(SetIdxLen.W)
+  val bankIdx:   UInt         = UInt(log2Ceil(NumInternalBanks).W)
+  val wayIdx:    UInt         = UInt(log2Ceil(NumWay).W)
+  val entry:     MainBtbEntry = new MainBtbEntry
+}
+
+class MainBtbTrace(implicit p: Parameters) extends MainBtbBundle {
+
+  val startPc:     Pc              = Pc()
+  val cfiPosition: UInt            = UInt(CfiPositionWidth.W)
+  val attribute:   BranchAttribute = new BranchAttribute
+
+  val setIdx:       UInt = UInt(SetIdxLen.W)
+  val internalIdx:  UInt = UInt(InternalBankIdxLen.W)
+  val alignBankIdx: UInt = UInt(AlignBankIdxLen.W)
+  val wayIdx:       UInt = UInt(NumWay.W)
+}
+
+class VictimBtbEntry(implicit p: Parameters) extends MainBtbBundle {
+  val setIdx:          UInt            = UInt(SetIdxLen.W)
+  val internalBankIdx: UInt            = UInt(InternalBankIdxLen.W)
+  val entry:           MainBtbEntry    = new MainBtbEntry
+  val counter:         SaturateCounter = TakenCounter()
 }

@@ -32,12 +32,12 @@ import utility.SelectTwoInterRes
 import utility.XSDebug
 import utility.XSPerfAccumulate
 import xiangshan.XSModule
-import xiangshan.frontend.PrunedAddr
-import xiangshan.frontend.PrunedAddrInit
+import xiangshan.frontend.GuardedPc
+import xiangshan.frontend.GuardedPcInit
 import xiangshan.frontend.bpu.BasePredictor
 import xiangshan.frontend.bpu.BasePredictorIO
-import xiangshan.frontend.bpu.BpuTrain
 import xiangshan.frontend.bpu.SaturateCounter
+import xiangshan.frontend.bpu.Train
 import xiangshan.frontend.bpu.WriteBuffer
 import xiangshan.frontend.bpu.history.phr.PhrAllFoldedHistories
 
@@ -53,27 +53,28 @@ class Ittage(implicit p: Parameters) extends BasePredictor with HasIttageParamet
 
   val io: IttageIO = IO(new IttageIO)
 
-  io.resetDone := true.B // FIXME: sram read ready
+  io.trainReady := true.B
 
-  io.train.ready := true.B
+  private val s0_startPc = io.startPc
+  private val s0_fire    = io.stageCtrl.s0_fire && io.enable
+  private val s1_fire    = io.stageCtrl.s1_fire && io.enable
+  private val s2_fire    = io.stageCtrl.s2_fire && io.enable
+  private val s3_fire    = io.stageCtrl.s3_fire && io.enable
 
-  private val s0_pc   = io.startVAddr
-  private val s0_fire = io.stageCtrl.s0_fire && io.enable
-  private val s1_fire = io.stageCtrl.s1_fire && io.enable
-  private val s2_fire = io.stageCtrl.s2_fire && io.enable
-  private val s3_fire = io.stageCtrl.s3_fire && io.enable
+  private val s1_startPc = RegEnable(s0_startPc, s0_fire)
+  private val s2_startPc = RegEnable(s1_startPc, s1_fire)
 
-  private val s1_pc = RegEnable(s0_pc, s0_fire)
-  private val s2_pc = RegEnable(s1_pc, s1_fire)
-
+  // Each ITTAGE table manages its own banking (NumBanks parameter); top-level only supplies PC/history.
   private val tables = TableInfos.zipWithIndex.map {
     case (info, i) =>
-      val t = Module(new IttageTable(info.Size, info.HistoryLength, TagWidth, i))
+      val t = Module(new IttageTable(i, info))
       t
   }
 
+  io.sramResetDone := tables.map(_.io.sramResetDone).reduce(_ && _)
+
   private val useAltOnNa = RegInit((1 << (UseAltOnNaWidth - 1)).U(UseAltOnNaWidth.W))
-  private val tickCnt    = RegInit(0.U.asTypeOf(new SaturateCounter(TickWidth)))
+  private val tickCnt    = RegInit(TickCounter.Zero)
 
   private val rTable = Module(new RegionWays)
 
@@ -87,16 +88,16 @@ class Ittage(implicit p: Parameters) extends BasePredictor with HasIttageParamet
 
   private val s2_resps = VecInit(tables.map(t => t.io.resp))
 
-  private val s2_ittageTarget      = Wire(PrunedAddr(VAddrBits))
-  private val s2_providerTarget    = Wire(PrunedAddr(VAddrBits))
-  private val s2_altProviderTarget = Wire(PrunedAddr(VAddrBits))
+  private val s2_ittageTarget      = Wire(GuardedPc())
+  private val s2_providerTarget    = Wire(GuardedPc())
+  private val s2_altProviderTarget = Wire(GuardedPc())
   private val s2_provided          = Wire(Bool())
   private val s2_provider          = Wire(UInt(log2Ceil(NumTables).W))
   private val s2_altProvided       = Wire(Bool())
   private val s2_altProvider       = Wire(UInt(log2Ceil(NumTables).W))
-  private val s2_providerUsefulCnt = Wire(new SaturateCounter(UsefulCntWidth))
-  private val s2_providerCnt       = Wire(new SaturateCounter(ConfidenceCntWidth))
-  private val s2_altProviderCnt    = Wire(new SaturateCounter(ConfidenceCntWidth))
+  private val s2_providerUsefulCnt = Wire(UsefulCounter())
+  private val s2_providerCnt       = Wire(ConfidenceCounter())
+  private val s2_altProviderCnt    = Wire(ConfidenceCounter())
 
   private val s3_ittageTarget      = RegEnable(s2_ittageTarget, s2_fire)
   private val s3_providerTarget    = RegEnable(s2_providerTarget, s2_fire)
@@ -112,64 +113,69 @@ class Ittage(implicit p: Parameters) extends BasePredictor with HasIttageParamet
   private val ittageMeta = WireDefault(0.U.asTypeOf(new IttageMeta))
   io.meta := ittageMeta
 
-  private val t1_train = Wire(new BpuTrain)
-  t1_train := RegEnable(io.train.bits, 0.U.asTypeOf(new BpuTrain), io.train.fire)
+  private val t0_fire = io.enable && io.stageCtrl.t0_fire
+
+  private val t1_train = Wire(new Train)
+  t1_train := RegEnable(io.train, 0.U.asTypeOf(new Train), t0_fire)
 
   private val t1_meta = Wire(new IttageMeta)
   t1_train.meta.ittage := t1_meta
 
-  private val t1_trainFoldedPhr = RegEnable(io.trainFoldedPhr, io.train.fire)
+  private val t1_trainFoldedPhr = RegEnable(io.trainFoldedPhr, t0_fire)
 
-  private val updatePc        = t1_train.startVAddr
+  private val updateStartPc   = t1_train.startPc
   private val updateFoldedPhr = t1_trainFoldedPhr
 
   // To improve Clock Gating Efficiency
-  private val t0_meta = io.train.bits.meta.ittage
-  t1_meta := RegEnable(t0_meta, io.train.fire)
+  private val t0_meta = io.train.meta.ittage
+  t1_meta := RegEnable(t0_meta, t0_fire)
   t1_meta.provider.bits := RegEnable(
     t0_meta.provider.bits,
-    io.train.fire && t0_meta.provider.valid
+    t0_fire && t0_meta.provider.valid
   )
   t1_meta.providerTarget := RegEnable(
     t0_meta.providerTarget,
     0.U.asTypeOf(t0_meta.providerTarget),
-    io.train.fire && t0_meta.provider.valid
+    t0_fire && t0_meta.provider.valid
   )
   t1_meta.allocate.bits := RegEnable(
     t0_meta.allocate.bits,
-    io.train.fire && t0_meta.allocate.valid
+    t0_fire && t0_meta.allocate.valid
   )
   t1_meta.altProvider.bits := RegEnable(
     t0_meta.altProvider.bits,
-    io.train.fire && t0_meta.altProvider.valid
+    t0_fire && t0_meta.altProvider.valid
   )
   t1_meta.altProviderTarget := RegEnable(
     t0_meta.altProviderTarget,
     0.U.asTypeOf(t0_meta.altProviderTarget),
-    io.train.fire && t0_meta.provider.valid && t0_meta.altProvider.valid && t0_meta.providerCnt.isSaturateNegative
+    t0_fire && t0_meta.provider.valid && t0_meta.altProvider.valid && t0_meta.providerCnt.isSaturateNegative
   )
 
   // Select the branch needed for training
   val trainBranchIdxVec: Vec[Bool] = VecInit(t1_train.branches.map(b =>
-    b.valid && b.bits.attribute.isOtherIndirect && b.bits.taken
+    b.valid && b.bits.attribute.needIttage && b.bits.taken
   ))
+  assert(
+    PopCount(trainBranchIdxVec) <= 1.U,
+    "At most one branch in branches should be valid and isOtherIndirect for ITTAGE update"
+  )
   val trainBranchIdx: UInt = PriorityEncoder(trainBranchIdxVec)
   val hasTrainBranch: Bool = trainBranchIdxVec.asUInt.orR
 
   // Update condition for ittage
-  private val updateValid = hasTrainBranch && RegNext(io.train.fire, init = false.B)
+  private val updateValid = hasTrainBranch && RegNext(t0_fire, init = false.B)
 
   private val updateMask            = WireInit(0.U.asTypeOf(Vec(NumTables, Bool())))
   private val updateUsefulCntMask   = WireInit(0.U.asTypeOf(Vec(NumTables, Bool())))
   private val updateResetUsefulCnt  = WireInit(false.B)
   private val updateCorrect         = Wire(Vec(NumTables, Bool()))
-  private val updateAlloc           = Wire(Vec(NumTables, Bool()))
-  private val updateOldCnt          = Wire(Vec(NumTables, new SaturateCounter(ConfidenceCntWidth)))
-  private val updateUsefulCnt       = Wire(Vec(NumTables, new SaturateCounter(UsefulCntWidth)))
+  private val updateAlloc           = WireInit(0.U.asTypeOf(Vec(NumTables, Bool())))
+  private val updateOldCnt          = Wire(Vec(NumTables, ConfidenceCounter()))
+  private val updateUsefulCnt       = Wire(Vec(NumTables, UsefulCounter()))
   private val updateTargetOffset    = Wire(Vec(NumTables, new IttageOffset))
   private val updateOldTargetOffset = Wire(Vec(NumTables, new IttageOffset))
   updateCorrect         := DontCare
-  updateAlloc           := DontCare
   updateOldCnt          := DontCare
   updateUsefulCnt       := DontCare
   updateTargetOffset    := DontCare
@@ -182,17 +188,17 @@ class Ittage(implicit p: Parameters) extends BasePredictor with HasIttageParamet
   // Predict
   tables.foreach { t =>
     t.io.req.valid           := s1_fire && s1_isIndirect // TODO: s1_isIndirect for low power
-    t.io.req.bits.pc         := s1_pc
+    t.io.req.bits.startPc    := s1_startPc.unGuard
     t.io.req.bits.foldedHist := io.s1_foldedPhr
   }
 
   // access tag tables and output meta info
   class IttageTableInfo extends Bundle {
-    val cnt:          SaturateCounter = new SaturateCounter(ConfidenceCntWidth)
-    val usefulCnt:    SaturateCounter = new SaturateCounter(UsefulCntWidth)
+    val cnt:          SaturateCounter = ConfidenceCounter()
+    val usefulCnt:    SaturateCounter = UsefulCounter()
     val targetOffset: IttageOffset    = new IttageOffset
     val tableIdx:     UInt            = UInt(log2Ceil(NumTables).W)
-    val maskTarget:   Vec[UInt]       = Vec(NumTables, UInt(VAddrBits.W))
+    val maskTarget:   Vec[UInt]       = Vec(NumTables, UInt(GuardedVAddrBits.W))
   }
 
   private val inputRes = VecInit(s2_resps.zipWithIndex.map {
@@ -202,7 +208,7 @@ class Ittage(implicit p: Parameters) extends BasePredictor with HasIttageParamet
       tableInfo.cnt           := r.bits.cnt
       tableInfo.targetOffset  := r.bits.targetOffset
       tableInfo.tableIdx      := i.U(log2Ceil(NumTables).W)
-      tableInfo.maskTarget    := VecInit(Seq.fill(NumTables)(0.U(VAddrBits.W)))
+      tableInfo.maskTarget    := VecInit(Seq.fill(NumTables)(0.U(GuardedVAddrBits.W)))
       tableInfo.maskTarget(i) := "hffff_ffff_ffff_ffff".U
       SelectTwoInterRes(r.valid, tableInfo)
   })
@@ -222,25 +228,29 @@ class Ittage(implicit p: Parameters) extends BasePredictor with HasIttageParamet
   }
 
   // When the entry corresponding to the pointer is valid and does not use PCRegion, use rTable region.
-  private val regionTargets = Wire(Vec(NumTables, PrunedAddr(VAddrBits)))
+  private val regionTargets = Wire(Vec(NumTables, GuardedPc()))
   for (i <- 0 until NumTables) {
-    regionTargets(i) := PrunedAddrInit(Mux(
+    regionTargets(i) := GuardedPcInit(Mux(
       rTable.io.respHit(i) && !regionReadTargetOffset(i).usePcRegion,
-      Cat(rTable.io.respRegion(i), regionReadTargetOffset(i).offset.toUInt),
-      Cat(targetGetRegion(s2_pc), regionReadTargetOffset(i).offset.toUInt)
+      Cat(
+        s2_startPc(GuardedVAddrBits - 1),
+        rTable.io.respRegion(i),
+        regionReadTargetOffset(i).offset.toUInt
+      ),
+      Cat(targetGetRegion(s2_startPc), regionReadTargetOffset(i).offset.toUInt)
     ))
   }
 
-  private val providerCatTarget = PrunedAddrInit(providerInfo.maskTarget.zipWithIndex.map {
+  private val providerCatTarget = GuardedPcInit(providerInfo.maskTarget.zipWithIndex.map {
     case (mask, i) => mask & regionTargets(i).toUInt
   }.reduce(_ | _))
 
-  private val altProviderCatTarget = PrunedAddrInit(altProviderInfo.maskTarget.zipWithIndex.map {
+  private val altProviderCatTarget = GuardedPcInit(altProviderInfo.maskTarget.zipWithIndex.map {
     case (mask, i) => mask & regionTargets(i).toUInt
   }.reduce(_ | _))
 
   s2_ittageTarget := MuxCase(
-    0.U.asTypeOf(PrunedAddr(VAddrBits)),
+    0.U.asTypeOf(GuardedPc()),
     Seq(
       (provided && !(providerNull && altProvided)) -> providerCatTarget,
       (providerNull && altProvided)                -> altProviderCatTarget
@@ -257,7 +267,7 @@ class Ittage(implicit p: Parameters) extends BasePredictor with HasIttageParamet
   io.prediction.hit    := s3_fire && s3_provided
   io.prediction.target := s3_ittageTarget
 //  when(io.prediction.hit) {
-//    assert(io.prediction.target =/= 0.U.asTypeOf(PrunedAddr(VAddrBits)))
+//    assert(io.prediction.target =/= 0.U.asTypeOf(GuardedPc()))
 //  }
 
   s2_provided          := provided
@@ -277,12 +287,12 @@ class Ittage(implicit p: Parameters) extends BasePredictor with HasIttageParamet
   ittageMeta.provider.bits     := s3_provider
   ittageMeta.altProvider.valid := s3_altProvided
   ittageMeta.altProvider.bits  := s3_altProvider
-  ittageMeta.altDiffers        := s3_providerTarget =/= s3_altProviderTarget
+  ittageMeta.altDiffers        := s3_altProvided && s3_providerTarget =/= s3_altProviderTarget
   ittageMeta.providerUsefulCnt := s3_providerUsefulCnt
   ittageMeta.providerCnt       := s3_providerCnt
   ittageMeta.altProviderCnt    := s3_altProviderCnt
-  ittageMeta.providerTarget    := s3_providerTarget
-  ittageMeta.altProviderTarget := s3_altProviderTarget
+  ittageMeta.providerTarget    := s3_providerTarget.unGuard
+  ittageMeta.altProviderTarget := s3_altProviderTarget.unGuard
   ittageMeta.debug_predCycle.foreach(_ := GTimer())
   // Create a mask fo tables which did not hit our query, and also contain useless entries
   // and also uses a longer history than the provider
@@ -297,7 +307,7 @@ class Ittage(implicit p: Parameters) extends BasePredictor with HasIttageParamet
 
   // Update in loop
   private val updateRealTarget       = t1_train.branches(trainBranchIdx).bits.target
-  private val updatePCRegion         = targetGetRegion(t1_train.startVAddr)
+  private val updatePCRegion         = targetGetRegion(t1_train.startPc)
   private val updateRealTargetRegion = targetGetRegion(updateRealTarget)
   private val metaProviderTargetOffset, metaAltProviderTargetOffset, updateRealTargetOffset =
     WireInit(0.U.asTypeOf(new IttageOffset))
@@ -344,7 +354,7 @@ class Ittage(implicit p: Parameters) extends BasePredictor with HasIttageParamet
       updateUsefulCnt(provider) := Mux(
         !t1_meta.altDiffers,
         t1_meta.providerUsefulCnt,
-        (t1_meta.providerTarget === updateRealTarget).asTypeOf(new SaturateCounter(UsefulCntWidth))
+        (t1_meta.providerTarget === updateRealTarget).asTypeOf(UsefulCounter())
       )
       updateCorrect(provider)         := t1_meta.providerTarget === updateRealTarget
       updateOldCnt(provider)          := t1_meta.providerCnt
@@ -369,13 +379,13 @@ class Ittage(implicit p: Parameters) extends BasePredictor with HasIttageParamet
   private val allocate        = t1_meta.allocate
 
   when(updateValid && updateMisPred && !(providerCorrect && providerUnconf)) {
-    tickCnt.update(!allocate.valid)
+    tickCnt.selfUpdate(!allocate.valid)
     when(allocate.valid) {
       updateMask(allocate.bits)          := true.B
       updateCorrect(allocate.bits)       := false.B // useless for alloc
       updateAlloc(allocate.bits)         := true.B
       updateUsefulCntMask(allocate.bits) := true.B
-      updateUsefulCnt(allocate.bits)     := false.B.asTypeOf(new SaturateCounter(UsefulCntWidth))
+      updateUsefulCnt(allocate.bits)     := UsefulCounter.SaturateNegative
       updateTargetOffset(allocate.bits)  := updateRealTargetOffset
     }
   }
@@ -401,7 +411,7 @@ class Ittage(implicit p: Parameters) extends BasePredictor with HasIttageParamet
 
     tables(i).io.update.usefulCntValid := RegEnable(updateUsefulCntMask(i), false.B, updateMask(i))
     tables(i).io.update.usefulCnt      := RegEnable(updateUsefulCnt(i), updateMask(i))
-    tables(i).io.update.pc             := RegEnable(updatePc, updateMask(i))
+    tables(i).io.update.startPc        := RegEnable(updateStartPc, updateMask(i))
     tables(i).io.update.foldedHist     := RegEnable(updateFoldedPhr, updateMask(i))
   }
 
@@ -423,16 +433,14 @@ class Ittage(implicit p: Parameters) extends BasePredictor with HasIttageParamet
     commitPerf(s"ittage_${name}", commitCond)
   }
 
-  def ctrNull(ctr: SaturateCounter): Bool = ctr.isSaturateNegative
-
-  private val predUseProvider     = s2_provided && !ctrNull(s2_providerCnt)
-  private val predUseAltPred      = s2_provided && ctrNull(s2_providerCnt)
+  private val predUseProvider     = s2_provided && !s2_providerCnt.isSaturateNegative
+  private val predUseAltPred      = s2_provided && s2_providerCnt.isSaturateNegative
   private val predUseHtAsAltPred  = predUseAltPred && s2_altProvided
   private val predUseBimAsAltPred = predUseAltPred && !s2_altProvided
   private val predUseBimAsPred    = !s2_provided
 
-  private val commitUseProvider     = t1_meta.provider.valid && !ctrNull(t1_meta.providerCnt)
-  private val commitUseAltPred      = t1_meta.provider.valid && ctrNull(t1_meta.providerCnt)
+  private val commitUseProvider     = t1_meta.provider.valid && !t1_meta.providerCnt.isSaturateNegative
+  private val commitUseAltPred      = t1_meta.provider.valid && t1_meta.providerCnt.isSaturateNegative
   private val commitUseHtAsAltPred  = commitUseAltPred && t1_meta.altProvider.valid
   private val commitUseFtbAsAltPred = commitUseAltPred && !t1_meta.altProvider.valid
   private val commitUseFtbAsPred    = !t1_meta.provider.valid
@@ -474,11 +482,11 @@ class Ittage(implicit p: Parameters) extends BasePredictor with HasIttageParamet
 
   if (debug) {
     val s2_respsRegs = RegEnable(s2_resps, s2_fire)
-    XSDebug("req: v=%d, pc=0x%x\n", s0_fire, s0_pc.toUInt)
-    XSDebug("s1_fire:%d, resp: pc=%x\n", s1_fire, s1_pc.toUInt)
+    XSDebug("req: v=%d, pc=0x%x\n", s0_fire, s0_startPc.toUInt)
+    XSDebug("s1_fire:%d, resp: pc=%x\n", s1_fire, s1_startPc.toUInt)
     XSDebug(
       "s2_fireOnLastCycle: resp: pc=%x, hit=%b\n",
-      s2_pc.toUInt,
+      s2_startPc.toUInt,
       s2_provided
     )
     for (i <- 0 until NumTables) {
@@ -494,7 +502,7 @@ class Ittage(implicit p: Parameters) extends BasePredictor with HasIttageParamet
   }
   XSDebug(
     updateValid,
-    p"pc: ${Hexadecimal(updatePc.toUInt)}, target: ${Hexadecimal(t1_train.branches(trainBranchIdx).bits.target.toUInt)}\n"
+    p"pc: ${Hexadecimal(updateStartPc.toUInt)}, target: ${Hexadecimal(t1_train.branches(trainBranchIdx).bits.target.toUInt)}\n"
   )
   XSDebug(updateValid, t1_meta.toPrintable + p"\n")
   XSDebug(updateValid, p"correct(${!updateMisPred})\n")

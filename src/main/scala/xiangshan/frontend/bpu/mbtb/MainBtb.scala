@@ -18,18 +18,26 @@ package xiangshan.frontend.bpu.mbtb
 import chisel3._
 import chisel3.util._
 import org.chipsalliance.cde.config.Parameters
+import utility.ChiselDB
 import utility.XSPerfAccumulate
 import utility.XSPerfHistogram
+import utility.XSPerfRolling
 import utils.VecRotate
 import xiangshan.frontend.bpu.BasePredictor
 import xiangshan.frontend.bpu.BasePredictorIO
-import xiangshan.frontend.bpu.BtbInfo
+import xiangshan.frontend.bpu.Prediction
 
 class MainBtb(implicit p: Parameters) extends BasePredictor with HasMainBtbParameters with Helpers {
   class MainBtbIO(implicit p: Parameters) extends BasePredictorIO {
     // prediction specific bundle
-    val result: Vec[Valid[BtbInfo]] = Output(Vec(NumBtbResultEntries, Valid(new BtbInfo)))
-    val meta:   MainBtbMeta         = Output(new MainBtbMeta)
+    val result: Vec[Valid[Prediction]] = Output(Vec(NumBtbResultEntries, Valid(new Prediction)))
+    val meta:   MainBtbMeta            = Output(new MainBtbMeta)
+
+    // timing optimization: send positions earlier to TAGE
+    val s1_positions: Vec[UInt] = Output(Vec(NumBtbResultEntries, UInt(CfiPositionWidth.W)))
+
+    // final s3_takenMask (mbtb + tage + sc), used to touch replacer accurately
+    val s3_takenMask: Vec[Bool] = Input(Vec(NumBtbResultEntries, Bool()))
   }
 
   val io: MainBtbIO = IO(new MainBtbIO)
@@ -43,106 +51,144 @@ class MainBtb(implicit p: Parameters) extends BasePredictor with HasMainBtbParam
   /* *** submodules *** */
   private val alignBanks = Seq.tabulate(NumAlignBanks)(alignIdx => Module(new MainBtbAlignBank(alignIdx)))
 
-  io.resetDone := alignBanks.map(_.io.resetDone).reduce(_ && _)
+  io.sramResetDone := alignBanks.map(_.io.sramResetDone).reduce(_ && _)
 
-  io.train.ready := true.B
+  io.trainReady := true.B
 
-  private val s0_fire, s1_fire, s2_fire = Wire(Bool())
   alignBanks.foreach { b =>
-    b.io.stageCtrl.s0_fire := s0_fire
-    b.io.stageCtrl.s1_fire := s1_fire
-    b.io.stageCtrl.s2_fire := s2_fire
-    b.io.stageCtrl.s3_fire := false.B
+    b.io.stageCtrl := io.stageCtrl
+    b.io.enable    := io.enable
   }
 
   /* *** s0 ***
-   * calculate per-bank startVAddr and posHigherBits
+   * calculate per-bank startPc and posHigherBits
    * send read request to alignBanks
    */
-  s0_fire := io.stageCtrl.s0_fire && io.enable
-  private val s0_startVAddr = io.startVAddr
+  // predict pipeline is in the alignBank, so no top-level s0_fire etc..
+  private val s0_startPc = io.startPc
   // rotate read addresses according to the first align bank index
-  // e.g. if NumAlignBanks = 4, startVAddr locates in alignBank 1,
-  // startVAddr + (i << FetchBlockAlignWidth) will be located in alignBank (1 + i) % 4,
+  // e.g. if NumAlignBanks = 4, startPc locates in alignBank 1,
+  // startPc + (i << FetchBlockAlignWidth) will be located in alignBank (1 + i) % 4,
   // i.e. we have VecInit.tabulate(...)'s alignBankIdx = (1, 2, 3, 0),
   // they always needs to goes to physical alignBank (0, 1, 2, 3),
   // so we need to rotate it right by 1.
-  private val s0_rotator = VecRotate(getAlignBankIndex(s0_startVAddr))
-  private val s0_startVAddrVec = s0_rotator.rotate(
+  private val s0_rotator = VecRotate(getAlignBankIndex(s0_startPc))
+  private val s0_startPcVec = s0_rotator.rotate(
     VecInit.tabulate(NumAlignBanks) { i =>
       if (i == 0)
-        s0_startVAddr // keep lower bits for the first one
+        s0_startPc // keep lower bits for the first one
       else
-        getAlignedAddr(s0_startVAddr + (i << FetchBlockAlignWidth).U) // use aligned for others
+        getAlignedPc(s0_startPc + (i << FetchBlockAlignWidth).U) // use aligned for others
     }
   )
   private val s0_posHigherBitsVec = s0_rotator.rotate(VecInit.tabulate(NumAlignBanks)(_.U(AlignBankIdxLen.W)))
 
   alignBanks.zipWithIndex.foreach { case (b, i) =>
-    b.io.read.req.startVAddr    := s0_startVAddrVec(i)
+    b.io.read.req.startPc       := s0_startPcVec(i)
     b.io.read.req.posHigherBits := s0_posHigherBitsVec(i)
-    b.io.read.req.crossPage     := isCrossPage(s0_startVAddrVec(i), s0_startVAddr)
+    b.io.read.req.crossPage     := isCrossPage(s0_startPcVec(i), s0_startPc)
   }
 
   /* *** s1 ***
    * just wait alignBanks
    */
-  s1_fire := io.stageCtrl.s1_fire && io.enable
-
-  /* *** s2 ***
-   * receive read response from alignBanks
-   * send out prediction result and meta info
-   */
-  s2_fire := io.stageCtrl.s2_fire && io.enable
+  io.s1_positions := VecInit(alignBanks.flatMap(_.io.read.s1_positions))
 
   // we don't care about the order of alignBanks' responses,
   // (as s0_posHigherBitsVec is already computed and concatenated to each entry's posLowerBits)
   // (and we care about the full position when searching for a matching entry, not the bank it comes from)
   // so here we just flatten them, without rotating them back to the original order
-  io.result       := VecInit(alignBanks.flatMap(_.io.read.resp.map(_.info)))
-  io.meta.entries := VecInit(alignBanks.map(b => VecInit(b.io.read.resp.map(_.meta))))
+  io.result := VecInit(alignBanks.flatMap(_.io.read.resp.predictions))
+  // we don't need to flatten meta entries, keep the alignBank structure, anyway we just use them per alignBank
+  io.meta.entries := VecInit(alignBanks.map(_.io.read.resp.metas))
+
+  /* *** s3 ***
+   * touch replacer using final takenMask (mbtb + tage + sc)
+   */
+  // io.result is flattened, so use each align bank's last result as its VBTB taken feedback.
+  alignBanks.zipWithIndex.foreach { case (b, i) =>
+    b.io.s3_vbtbTaken := io.s3_takenMask(i * (NumWay + 1) + NumWay)
+  }
 
   /* *** t0 ***
-   * receive training data and latch
+   * receive training data
+   * send startPc to alignBank for replacer state reading
    */
-  private val t0_valid = io.train.fire && io.enable
-  private val t0_train = io.train.bits
+  private val t0_fire  = io.stageCtrl.t0_fire && io.enable
+  private val t0_train = io.train
+
+  private val t0_startPc          = t0_train.startPc
+  private val t0_rotator          = VecRotate(getAlignBankIndex(t0_startPc))
+  private val t0_startPcVec       = t0_rotator.rotate(t0_train.startPcVec.get)
+  private val t0_posBitsHigherVec = t0_rotator.rotate(VecInit.tabulate(NumAlignBanks)(_.U(AlignBankIdxLen.W)))
+
+  alignBanks.zipWithIndex.foreach { case (b, i) =>
+    b.io.t0_startPc := t0_startPcVec(i)
+  }
 
   /* *** t1 ***
    * calculate write data and write to alignBanks
    */
-  private val t1_valid = RegNext(t0_valid) && io.enable
-  private val t1_train = RegEnable(t0_train, t0_valid)
+  private val t1_fire  = RegNext(t0_fire, init = false.B)
+  private val t1_train = RegEnable(t0_train, t0_fire)
 
-  private val t1_startVAddr = t1_train.startVAddr
-  private val t1_rotator    = VecRotate(getAlignBankIndex(t1_startVAddr))
-  private val t1_startVAddrVec = t1_rotator.rotate(
-    VecInit.tabulate(NumAlignBanks)(i => getAlignedAddr(t1_startVAddr + (i << FetchBlockAlignWidth).U))
-  )
-  private val t1_meta             = t1_train.meta.mbtb
-  private val t1_mispredictBranch = t1_train.mispredictBranch
+  private val t1_rotator          = RegEnable(t0_rotator, t0_fire)
+  private val t1_startPcVec       = RegEnable(t0_startPcVec, t0_fire)
+  private val t1_posBitsHigherVec = RegEnable(t0_posBitsHigherVec, t0_fire)
 
-  private val t1_writeValid = t1_valid && t1_mispredictBranch.valid && t1_mispredictBranch.bits.taken
+  private val t1_meta           = t1_train.meta.mbtb
+  private val t1_mispredictInfo = t1_train.mispredictBranch
 
-  private val t1_writeAlignBankIdx  = getAlignBankIndexFromPosition(t1_mispredictBranch.bits.cfiPosition)
+  private val t1_writeAlignBankIdx  = getAlignBankIndexFromPosition(t1_mispredictInfo.bits.cfiPosition)
   private val t1_writeAlignBankMask = t1_rotator.rotate(VecInit(UIntToOH(t1_writeAlignBankIdx).asBools))
 
   alignBanks.zipWithIndex.foreach { case (b, i) =>
-    b.io.write.req.valid           := t1_writeValid && t1_writeAlignBankMask(i)
-    b.io.write.req.bits.startVAddr := t1_startVAddrVec(i)
-    b.io.write.req.bits.branchInfo := t1_mispredictBranch.bits
-    b.io.write.req.bits.meta       := t1_meta.entries(i)
+    b.io.write.req.valid              := t1_fire
+    b.io.write.req.bits.needWrite     := t1_writeAlignBankMask(i)
+    b.io.write.req.bits.startPc       := t1_startPcVec(i)
+    b.io.write.req.bits.branches      := t1_train.branches
+    b.io.write.req.bits.meta          := t1_meta.entries(i)
+    b.io.write.req.bits.posHigherBits := t1_posBitsHigherVec(i)
+    // see comments in MainBtbAlignBank.scala
+    b.io.write.req.bits.mispredictInfo := t1_mispredictInfo
   }
+  /* --------------------------------------------------------------------------------------------------------------
+     MainBTB Trace
+     -------------------------------------------------------------------------------------------------------------- */
+  private val alignBankTraceVec = alignBanks.map(_.io.trace)
+  private val finalTrace        = Mux1H(t1_writeAlignBankMask, alignBankTraceVec)
+  private val finalTraceStartPc = Mux1H(t1_writeAlignBankMask, t1_startPcVec)
+  private val mbtbTrace         = Wire(new MainBtbTrace)
+
+  mbtbTrace.startPc      := finalTraceStartPc
+  mbtbTrace.setIdx       := finalTrace.setIdx
+  mbtbTrace.internalIdx  := finalTrace.bankIdx
+  mbtbTrace.alignBankIdx := PriorityEncoder(t1_writeAlignBankMask)
+  mbtbTrace.wayIdx       := finalTrace.wayIdx
+  mbtbTrace.attribute    := finalTrace.entry.attribute
+  mbtbTrace.cfiPosition  := finalTrace.entry.position
+
+  private val mbtbTraceDBTable = ChiselDB.createTable("MBTBTrace", new MainBtbTrace(), EnableMainbtbTrace)
+  mbtbTraceDBTable.log(
+    data = mbtbTrace,
+    en = t1_fire && finalTrace.needWrite,
+    clock = clock,
+    reset = reset
+  )
 
   /* *** statistics *** */
-  private val perf_s2HitMask             = VecInit(alignBanks.flatMap(_.io.read.resp.map(_.info.valid)))
-  private val perf_t1HitMispredictBranch = t1_meta.entries.flatten.map(_.hit(t1_mispredictBranch.bits)).reduce(_ || _)
+  private val s2_fire                    = io.stageCtrl.s2_fire && io.enable
+  private val perf_s2HitMask             = VecInit(alignBanks.flatMap(_.io.read.resp.predictions.map(_.valid)))
+  private val perf_t1HitMispredictBranch = t1_meta.entries.flatten.map(_.hit(t1_mispredictInfo.bits)).reduce(_ || _)
+  private val pref_pred_miss             = s2_fire && perf_s2HitMask.reduce(!_ && !_)
 
-  XSPerfAccumulate("total_train", t1_valid)
+  XSPerfAccumulate("total_train", t1_fire)
   XSPerfAccumulate("pred_hit", s2_fire && perf_s2HitMask.reduce(_ || _))
-  XSPerfHistogram("pred_hit_count", PopCount(perf_s2HitMask), s2_fire, 0, NumWay * NumAlignBanks + 1)
-  XSPerfAccumulate("train_write_new_entry", t1_writeValid)
-  XSPerfAccumulate("train_has_mispredict", t1_valid && t1_mispredictBranch.valid)
-  XSPerfAccumulate("train_hit_mispredict", t1_valid && t1_mispredictBranch.valid && perf_t1HitMispredictBranch)
-  XSPerfAccumulate("pred_miss", s2_fire && perf_s2HitMask.reduce(!_ && !_))
+  XSPerfHistogram("pred_hit_count", PopCount(perf_s2HitMask), s2_fire, 0, NumBtbResultEntries + 1)
+  XSPerfAccumulate("train_has_mispredict", t1_fire && t1_mispredictInfo.valid)
+  XSPerfAccumulate("train_hit_mispredict", t1_fire && t1_mispredictInfo.valid && perf_t1HitMispredictBranch)
+  XSPerfAccumulate("pred_miss", pref_pred_miss)
+
+  XSPerfRolling("rolling_mbtb_pred_miss", pref_pred_miss, 10000, clock, reset)
+
 }

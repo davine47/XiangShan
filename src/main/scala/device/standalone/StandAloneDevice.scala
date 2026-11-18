@@ -146,12 +146,12 @@ abstract class StandAloneDevice (
 }
 
 class StandAloneDeviceImp(outer: StandAloneDevice)(implicit p: Parameters) extends LazyModuleImp(outer) with RequireAsyncReset {
-  override def localModulePrefix = p(SoCParamsKey).XSTopPrefix
+  override def localModulePrefix = p.lift(SoCParamsKey).flatMap(_.XSTopPrefix)
   override def localModulePrefixUseSeparator = false
 }
 
 class StandAloneDeviceRawImp(outer: StandAloneDevice)(implicit p: Parameters) extends LazyRawModuleImp(outer) {
-  override def localModulePrefix = p(SoCParamsKey).XSTopPrefix
+  override def localModulePrefix = p.lift(SoCParamsKey).flatMap(_.XSTopPrefix)
   override def localModulePrefixUseSeparator = false
 }
 
@@ -200,13 +200,17 @@ object ArgParser {
     require(addrWidth >= 0, "addrWidth not specified correctly")
     require(dataWidth >= 0, "dataWidth not specified correctly")
     val device: StandAloneDevice = module match {
+      case "StandAloneCLINT" =>
+        DisableMonitors(p => LazyModule(new StandAloneCLINT(
+          useTL, baseAddress, addrWidth, dataWidth, p(XSTileKey).size
+        )(p)))(p)
       case "StandAloneSYSCNT" =>
         DisableMonitors(p => LazyModule(new StandAloneSYSCNT(
           useTL, baseAddress, addrWidth, dataWidth, p(XSTileKey).size
         )(p)))(p)
       case "StandAlonePLIC" =>
         DisableMonitors(p => LazyModule(new StandAlonePLIC(
-          useTL, baseAddress, addrWidth, dataWidth, p(XSTileKey).size
+          useTL, baseAddress, addrWidth, dataWidth, p(XSTileKey).size, p(SoCParamsKey).extIntrs
         )(p)))(p)
       case "StandAloneDebugModule" =>
         DisableMonitors(p => LazyModule(new StandAloneDebugModule(

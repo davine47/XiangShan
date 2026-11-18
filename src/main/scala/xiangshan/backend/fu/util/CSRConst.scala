@@ -18,7 +18,6 @@ package xiangshan.backend.fu.util
 
 import chisel3._
 import chisel3.util._
-import freechips.rocketchip.rocket.CSRs
 
 trait HasCSRConst {
   // Supervisor Custom Read/Write
@@ -36,6 +35,7 @@ trait HasCSRConst {
 
   // Machine level Bitmap Check(Custom Read/Write)
   val Mbmc = 0xBC2
+  val Mmpt = 0x382
 
   def privEcall  = 0x000.U
   def privEbreak = 0x001.U
@@ -68,16 +68,16 @@ trait HasCSRConst {
   def IRQ_SGEIP = 12
   def IRQ_DEBUG = 17
 
-  val Hgatp_Mode_len = 4
-  val Hgatp_Vmid_len = 16
-  val Hgatp_Addr_len = 44
+  val HGATP_MODE_LEN = 4
+  val HGATP_VMID_LEN = 16
+  val HGATP_ADDR_LEN = 44
 
-  val Satp_Mode_len = 4
-  val Satp_Asid_len = 16
-  val Satp_Addr_len = 44
-  def satp_part_wmask(max_length: Int, length: Int) : UInt = {
-    require(length > 0 && length <= max_length)
-    ((1L << length) - 1).U(max_length.W)
+  val SATP_MODE_LEN = 4
+  val SATP_ASID_LEN = 16
+  val SATP_ADDR_LEN = 44
+  def satpPartWmask(maxLength: Int, length: Int) : UInt = {
+    require(length > 0 && length <= maxLength)
+    ((1L << length) - 1).U(maxLength.W)
   }
 
   val IntPriority = Seq(

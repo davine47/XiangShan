@@ -2,7 +2,6 @@ package xiangshan.backend.fu.NewCSR
 
 import chisel3._
 import chisel3.util._
-import freechips.rocketchip.rocket.CSRs
 import org.chipsalliance.cde.config.Parameters
 import xiangshan.backend.fu.PMAConfigEntry
 import xiangshan.backend.fu.util.CSRConst
@@ -92,7 +91,6 @@ class PMAEntryHandleModule(implicit p: Parameters) extends PMAModule with PMAIni
   }
 
   io.out.pmaAddrRData := pmaAddrR
-  io.out.pmaAddrRegOut := pmaAddr
 
 }
 
@@ -108,16 +106,15 @@ class PMAEntryHandleIOBundle(implicit p: Parameters) extends PMABundle {
   val out = Output(new Bundle {
     val pmaCfgWdata = UInt(PMXLEN.W)
     val pmaAddrRData = Vec(NumPMAReal, UInt(64.W))
-    val pmaAddrRegOut = Vec(NumPMAReal, UInt(64.W))
   })
 }
 
 trait PMAReadWrite extends PMAConst with PMPReadWrite {
-  def shift_addr(addr: BigInt): BigInt = {
+  def shiftAddr(addr: BigInt): BigInt = {
     addr >> 2
   }
 
-  def get_napot(base: BigInt, range: BigInt): BigInt = {
+  def getNapot(base: BigInt, range: BigInt): BigInt = {
     val PlatformGrainBytes = 1 << PlatformGrain
     if ((base % PlatformGrainBytes) != 0) {
       println("base: %x", base)
@@ -150,9 +147,9 @@ trait PMAReadWrite extends PMAConst with PMPReadWrite {
 
   def genAddr(init: PMAConfigEntry): BigInt = {
     if (init.a < 2) {
-      shift_addr(init.base_addr)
+      shiftAddr(init.baseAddr)
     } else {
-      get_napot(init.base_addr, init.range)
+      getNapot(init.baseAddr, init.range)
     }
   }
 

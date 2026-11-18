@@ -7,7 +7,7 @@ import utility._
 import xiangshan._
 import xiangshan.backend.BackendParams
 import xiangshan.backend.Bundles._
-import xiangshan.backend.issue.EntryBundles.{EntryDeqRespBundle, RespType}
+import xiangshan.backend.issue.EntryBundles.{IssueQueueRespBundle, RespType}
 import xiangshan.backend.issue._
 import xiangshan.mem.{SqPtr, LqPtr}
 
@@ -55,22 +55,13 @@ class Og2ForVector(params: BackendParams)(implicit p: Parameters) extends XSModu
       toIQ.zipWithIndex.foreach {
         case (og2Resp, exuId) =>
           val og2Failed = s2_toExuValid(iqId)(exuId) && !toExuReady(iqId)(exuId)
-          og2Resp.valid := s2_toExuValid(iqId)(exuId)
-          og2Resp.bits.robIdx := s2_toExuData(iqId)(exuId).robIdx
-          og2Resp.bits.uopIdx.foreach(_ := s2_toExuData(iqId)(exuId).vpu.get.vuopIdx)
-          og2Resp.bits.resp := Mux(og2Failed, RespType.block, 
-            if (og2Resp.bits.params match { case x => x.isVecMemIQ })
-              RespType.uncertain
-            else
-              RespType.success
-          )
-          og2Resp.bits.fuType := s2_toExuData(iqId)(exuId).fuType
-          og2Resp.bits.sqIdx.foreach(_ := 0.U.asTypeOf(new SqPtr))
-          og2Resp.bits.lqIdx.foreach(_ := 0.U.asTypeOf(new LqPtr))
+          // VecMem need oldest uop, otherwise s0 will be not ready
+          og2Resp.failed := og2Failed
+          og2Resp.finalSuccess := s2_toExuValid(iqId)(exuId) && toExuReady(iqId)(exuId)
+          og2Resp.fuType := s2_toExuData(iqId)(exuId).fuType
+          og2Resp.lqIdx.foreach(_ := 0.U.asTypeOf(new LqPtr))
+          og2Resp.isFmac := false.B
       }
-  }
-  io.toBypassNetworkImmInfo := io.fromOg1ImmInfo.zip(s1_validVec2.flatten).map{
-    case (imm, valid) => RegEnable(imm, valid)
   }
 }
 
@@ -80,10 +71,8 @@ class Og2ForVectorIO(params: BackendParams)(implicit p: Parameters) extends XSBu
   val flush: ValidIO[Redirect]                                    = Flipped(ValidIO(new Redirect))
   val ldCancel                                                    = Vec(backendParams.LduCnt + backendParams.HyuCnt, Flipped(new LoadCancelIO))
 
-  val fromOg1VfArith: MixedVec[MixedVec[DecoupledIO[ExuInput]]]   = Flipped(vecSchdParams.genExuInputBundle)
-  val fromOg1ImmInfo: Vec[ImmInfo]                                = Input(Vec(params.allIssueParams.filter(_.needOg2Resp).flatMap(_.exuBlockParams).size, new ImmInfo))
+  val fromOg1VfArith: MixedVec[MixedVec[DecoupledIO[Og1InUop]]]   = Flipped(vecSchdParams.genOg1InUopBundle)
 
-  val toVfArithExu                                                = MixedVec(vecSchdParams.genExuInputBundle)
+  val toVfArithExu                                                = MixedVec(vecSchdParams.genOg1InUopBundle)
   val toVfIQOg2Resp                                               = MixedVec(vecSchdParams.issueBlockParams.map(_.genOG2RespBundle))
-  val toBypassNetworkImmInfo: Vec[ImmInfo]                        = Output(Vec(params.allIssueParams.filter(_.needOg2Resp).flatMap(_.exuBlockParams).size, new ImmInfo))
 }

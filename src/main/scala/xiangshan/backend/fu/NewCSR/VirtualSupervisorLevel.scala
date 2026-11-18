@@ -3,7 +3,6 @@ package xiangshan.backend.fu.NewCSR
 import chisel3._
 import chisel3.util.BitPat.bitPatToUInt
 import chisel3.util._
-import freechips.rocketchip.rocket.CSRs
 import utility.{SignExt, ZeroExt}
 import xiangshan.backend.fu.NewCSR.CSRBundles._
 import xiangshan.backend.fu.NewCSR.CSRDefines.{VirtMode, CSRROField => RO, CSRRWField => RW, CSRWARLField => WARL, CSRWLRLField => WLRL, _}
@@ -12,6 +11,7 @@ import xiangshan.backend.fu.NewCSR.CSREnumTypeImplicitCast._
 import xiangshan.backend.fu.NewCSR.CSRBundleImplicitCast._
 import xiangshan.backend.fu.NewCSR.CSRConfig.PPNLength
 import xiangshan.backend.fu.NewCSR.ChiselRecordForField._
+import xiangshan.backend.decode.isa.CSRs
 
 import scala.collection.immutable.SeqMap
 
@@ -128,7 +128,7 @@ trait VirtualSupervisorLevel { self: NewCSR with SupervisorLevel with Hypervisor
   val vstvec = Module(new CSRModule("VStvec", new XtvecBundle))
     .setAddr(CSRs.vstvec)
 
-  val vsscratch = Module(new CSRModule("VSscratch"))
+  val vsscratch = Module(new CSRModule("VSscratch", new ScratchBundle("Virtual supervisor-mode scratch register.")))
     .setAddr(CSRs.vsscratch)
 
   val vsepc = Module(
@@ -189,7 +189,7 @@ trait VirtualSupervisorLevel { self: NewCSR with SupervisorLevel with Hypervisor
   }).setAddr(CSRs.vsip)
 
   val vstimecmp = Module(new CSRModule("VStimecmp", new CSRBundle {
-    val vstimecmp = RW(63, 0).withReset(bitPatToUInt(BitPat.Y(64)))
+    val vstimecmp = RW(63, 0).withReset(bitPatToUInt(BitPat.Y(64))).withDescription("Virtual supervisor timer compare value.")
   }))
     .setAddr(CSRs.vstimecmp)
 
@@ -247,7 +247,7 @@ trait VirtualSupervisorLevel { self: NewCSR with SupervisorLevel with Hypervisor
     virtualSupervisorCSRMods.map(csr => (csr.addr -> csr.regOut.asInstanceOf[CSRBundle].asUInt))
   )
 
-  import freechips.rocketchip.rocket.CSRs
+  
 
   val sMapVS = SeqMap(
     CSRs.sstatus  -> CSRs.vsstatus,
@@ -261,6 +261,11 @@ trait VirtualSupervisorLevel { self: NewCSR with SupervisorLevel with Hypervisor
     CSRs.stimecmp -> CSRs.vstimecmp,
     CSRs.siselect -> CSRs.vsiselect,
     CSRs.sireg    -> CSRs.vsireg,
+    CSRs.sireg2   -> CSRs.vsireg2,
+    CSRs.sireg3   -> CSRs.vsireg3,
+    CSRs.sireg4   -> CSRs.vsireg4,
+    CSRs.sireg5   -> CSRs.vsireg5,
+    CSRs.sireg6   -> CSRs.vsireg6,
     CSRs.stopei   -> CSRs.vstopei,
     CSRs.satp     -> CSRs.vsatp,
     CSRs.stopi    -> CSRs.vstopi,

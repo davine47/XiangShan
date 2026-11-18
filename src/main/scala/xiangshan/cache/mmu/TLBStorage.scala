@@ -21,67 +21,7 @@ import chisel3._
 import chisel3.util._
 import utils._
 import utility._
-import freechips.rocketchip.formal.PropertyClass
 import xiangshan.backend.fu.util.HasCSRConst
-
-import scala.math.min
-
-// For Direct-map TLBs, we do not use it now
-class BankedAsyncDataModuleTemplateWithDup[T <: Data](
-  gen: T,
-  numEntries: Int,
-  numRead: Int,
-  numDup: Int,
-  numBanks: Int
-) extends Module {
-  val io = IO(new Bundle {
-    val raddr = Vec(numRead, Input(UInt(log2Ceil(numEntries).W)))
-    val rdata = Vec(numRead, Vec(numDup, Output(gen)))
-    val wen   = Input(Bool())
-    val waddr = Input(UInt(log2Ceil(numEntries).W))
-    val wdata = Input(gen)
-  })
-  require(numBanks > 1)
-  require(numEntries > numBanks)
-
-  val numBankEntries = numEntries / numBanks
-  def bankOffset(address: UInt): UInt = {
-    address(log2Ceil(numBankEntries) - 1, 0)
-  }
-
-  def bankIndex(address: UInt): UInt = {
-    address(log2Ceil(numEntries) - 1, log2Ceil(numBankEntries))
-  }
-
-  val dataBanks = Seq.tabulate(numBanks)(i => {
-    val bankEntries = if (i < numBanks - 1) numBankEntries else (numEntries - (i * numBankEntries))
-    Mem(bankEntries, gen)
-  })
-
-  // async read, but regnext
-  for (i <- 0 until numRead) {
-    val data_read = Reg(Vec(numDup, Vec(numBanks, gen)))
-    val bank_index = Reg(Vec(numDup, UInt(numBanks.W)))
-    for (j <- 0 until numDup) {
-      bank_index(j) := UIntToOH(bankIndex(io.raddr(i)))
-      for (k <- 0 until numBanks) {
-        data_read(j)(k) := Mux(io.wen && (io.waddr === io.raddr(i)),
-          io.wdata, dataBanks(k)(bankOffset(io.raddr(i))))
-      }
-    }
-    // next cycle
-    for (j <- 0 until numDup) {
-      io.rdata(i)(j) := Mux1H(bank_index(j), data_read(j))
-    }
-  }
-
-  // write
-  for (i <- 0 until numBanks) {
-    when (io.wen && (bankIndex(io.waddr) === i.U)) {
-      dataBanks(i)(bankOffset(io.waddr)) := io.wdata
-    }
-  }
-}
 
 class TLBFA(
   parentName: String,
@@ -112,12 +52,12 @@ class TLBFA(
     val OnlyS2 = req.bits.s2xlate === onlyStage2
     val OnlyS1 = req.bits.s2xlate === onlyStage1
     val refill_mask = Mux(io.w.valid, UIntToOH(io.w.bits.wayIdx), 0.U(nWays.W))
-    val hitVec = VecInit((entries.zipWithIndex).zip(v zip refill_mask.asBools).map{
-      case (e, m) => {
-        val s2xlate_hit = e._1.s2xlate === req.bits.s2xlate
-        val hit = e._1.hit(vpn, Mux(hasS2xlate, io.csr.vsatp.asid, io.csr.satp.asid), vmid = io.csr.hgatp.vmid, hasS2xlate = hasS2xlate, onlyS2 = OnlyS2, onlyS1 = OnlyS1)
-        s2xlate_hit && hit && m._1 && !m._2
-      }
+    val hitVec = VecInit(entries.zip(v zip refill_mask.asBools).map {
+      case (entry, (valid, refilling)) =>
+        val stageMatch = entry.s2xlate === req.bits.s2xlate
+        val hit = entry.hit(vpn, Mux(hasS2xlate, io.csr.vsatp.asid, io.csr.satp.asid),
+          vmid = io.csr.hgatp.vmid, hasS2xlate = hasS2xlate, onlyS2 = OnlyS2, onlyS1 = OnlyS1)
+        stageMatch && hit && valid && !refilling
     })
 
     hitVec.suggestName("hitVec")
@@ -126,31 +66,26 @@ class TLBFA(
     // Sector tlb may trigger multi-hit, see def "wbhit"
     XSPerfAccumulate(s"port${i}_multi_hit", !(!resp.valid || (PopCount(hitVecReg) === 0.U || PopCount(hitVecReg) === 1.U)))
 
-    resp.valid := GatedValidRegNext(req.valid)
+    resp.valid := RegNext(req.valid)
     resp.bits.hit := Cat(hitVecReg).orR
-    val reqVpn   = RegEnable(vpn, 0.U, req.fire)
-    val pbmt     = entries.map(_.pbmt)
-    val gpbmt    = entries.map(_.g_pbmt)
-    val perm     = entries.map(_.perm)
-    val gPerm    = entries.map(_.g_perm)
-    val s2xLate  = entries.map(_.s2xlate)
-    if (nWays == 1) {
-      for (d <- 0 until nDups) {
-        resp.bits.ppn(d) := entries(0).genPPN(saveLevel, resp.valid)(reqVpn)
-        resp.bits.pbmt(d) := pbmt(0)
-        resp.bits.g_pbmt(d) := gpbmt(0)
-        resp.bits.perm(d) := perm(0)
-        resp.bits.g_perm(d) := gPerm(0)
-        resp.bits.s2xlate(d) := s2xLate(0)
-      }
-    } else {
-      for (d <- 0 until nDups) {
-        resp.bits.ppn(d) := Mux1H(hitVecReg zip entries.map(_.genPPN(saveLevel, resp.valid)(reqVpn)))
-        resp.bits.pbmt(d) := Mux1H(hitVecReg zip pbmt)
-        resp.bits.g_pbmt(d) := Mux1H(hitVecReg zip gpbmt)
-        resp.bits.perm(d) := Mux1H(hitVecReg zip perm)
-        resp.bits.g_perm(d) := Mux1H(hitVecReg zip gPerm)
-        resp.bits.s2xlate(d) := Mux1H(hitVecReg zip s2xLate)
+    val reqVpn   = RegNext(vpn)
+    def selectHit[T <: Data](values: Seq[T]): T = {
+      if (nWays == 1) values.head else Mux1H(hitVecReg zip values)
+    }
+
+    for (d <- 0 until nDups) {
+      resp.bits.ppn(d) := selectHit(entries.map(_.genPPN(saveLevel, resp.valid)(reqVpn)))
+      resp.bits.pbmt(d) := selectHit(entries.map(_.pbmt))
+      resp.bits.g_pbmt(d) := selectHit(entries.map(_.g_pbmt))
+      resp.bits.perm(d) := selectHit(entries.map(_.perm))
+      resp.bits.g_perm(d) := selectHit(entries.map(_.g_perm))
+      resp.bits.s2xlate(d) := selectHit(entries.map(_.s2xlate))
+      if (HasMptCheck) {
+        val mptPerm = selectHit(entries.map(_.mptperm.get))
+        resp.bits.mptperm.get(d).x := mptPerm.x
+        resp.bits.mptperm.get(d).w := mptPerm.w
+        resp.bits.mptperm.get(d).r := mptPerm.r
+        resp.bits.mptperm.get(d).af.get := false.B
       }
     }
 
@@ -185,22 +120,22 @@ class TLBFA(
   }
 
   val sfence = io.sfence
-  val sfence_valid = sfence.valid && !sfence.bits.hg && !sfence.bits.hv
+  val sfence_valid = sfence.valid && !sfence.bits.hg && !sfence.bits.hv && (if (HasMptCheck) !(sfence.bits.mfence.get) else true.B)
   val sfence_vpn = sfence.bits.addr(VAddrBits - 1, offLen)
-  val sfenceHit = entries.map(_.hit(sfence_vpn, sfence.bits.id, vmid = io.csr.hgatp.vmid, hasS2xlate = io.csr.priv.virt))
-  val sfenceHit_noasid = entries.map(_.hit(sfence_vpn, sfence.bits.id, ignoreAsid = true, vmid = io.csr.hgatp.vmid, hasS2xlate = io.csr.priv.virt))
+  val sfenceHit = entries.map(_.hit(sfence_vpn, sfence.bits.id, vmid = io.csr.hgatp.vmid, hasS2xlate = io.csr.priv.fenceVirt))
+  val sfenceHit_noasid = entries.map(_.hit(sfence_vpn, sfence.bits.id, ignoreAsid = true, vmid = io.csr.hgatp.vmid, hasS2xlate = io.csr.priv.fenceVirt))
   // Sfence will flush all sectors of an entry when hit
   when (sfence_valid) {
-    when (sfence.bits.rs1 || io.csr.priv.virt || (if (HasBitmapCheck) (io.csr.mbmc.BME === 1.U && io.csr.mbmc.CMODE === 0.U) else false.B)) { // virtual address *.rs1 <- (rs1===0.U)
+    when (sfence.bits.rs1 || io.csr.priv.fenceVirt || (if (HasBitmapCheck) (io.csr.mbmc.BME === 1.U && io.csr.mbmc.CMODE === 0.U) else false.B)) { // virtual address *.rs1 <- (rs1===0.U)
       // Note: when virt=1, always flush all addr. See hfence.vvma comment.
       when (sfence.bits.rs2) { // asid, but i do not want to support asid, *.rs2 <- (rs2===0.U)
         // all addr and all asid
-        v.zipWithIndex.map{ case(a, i) => a := a && !((io.csr.priv.virt === false.B && entries(i).s2xlate === noS2xlate) ||
-          (io.csr.priv.virt && entries(i).s2xlate =/= noS2xlate && entries(i).vmid === io.csr.hgatp.vmid))}
+        v.zipWithIndex.map{ case(a, i) => a := a && !((io.csr.priv.fenceVirt === false.B && entries(i).s2xlate === noS2xlate) ||
+          (io.csr.priv.fenceVirt && entries(i).s2xlate =/= noS2xlate && entries(i).vmid === io.csr.hgatp.vmid))}
       }.otherwise {
         // all addr but specific asid
-        v.zipWithIndex.map{ case (a, i) => a := a && !(!g(i) && ((!io.csr.priv.virt && entries(i).s2xlate === noS2xlate && entries(i).asid === sfence.bits.id) ||
-          (io.csr.priv.virt && entries(i).s2xlate =/= noS2xlate && entries(i).asid === sfence.bits.id && entries(i).vmid === io.csr.hgatp.vmid)))}
+        v.zipWithIndex.map{ case (a, i) => a := a && !(!g(i) && ((!io.csr.priv.fenceVirt && entries(i).s2xlate === noS2xlate && entries(i).asid === sfence.bits.id) ||
+          (io.csr.priv.fenceVirt && entries(i).s2xlate =/= noS2xlate && entries(i).asid === sfence.bits.id && entries(i).vmid === io.csr.hgatp.vmid)))}
       }
     }.otherwise {
       when (sfence.bits.rs2) {
@@ -245,11 +180,11 @@ class TLBFA(
      *  sfence addr ---> |        |
      *  try to flush     |        |
      *                   +--------+
-     * 
-     * In this case, the VS-stage is a large page, while the G-stage is a small page. L1TLB stores them as a small page. 
-     * When hfence.vvma comes with an address in that VS large page but outside the small page, it should flush the VS page. 
+     *
+     * In this case, the VS-stage is a large page, while the G-stage is a small page. L1TLB stores them as a small page.
+     * When hfence.vvma comes with an address in that VS large page but outside the small page, it should flush the VS page.
      * However, since L1TLB always treats this entry as a small page, it cannot match this address, thus cannot flush this entry.
-     * 
+     *
     ***/
     // when (hfencev.bits.rs1) {
     //   // all addr
@@ -274,6 +209,16 @@ class TLBFA(
       v.zipWithIndex.map { case (a, i) => a := a && !(entries(i).s2xlate =/= noS2xlate && entries(i).vmid === sfence.bits.id) }
     }
   }
+  if (HasMptCheck) {
+    when(sfence.valid && sfence.bits.mfence.get) {
+      v.zipWithIndex.map { case (a, i) => a := false.B } // mfence reset all
+    }
+    val modechange = DataChanged(io.csr.satp.mode).asBool || DataChanged(io.csr.vsatp.mode).asBool ||
+      DataChanged(io.csr.hgatp.mode).asBool
+    when(modechange) {
+      v.zipWithIndex.map { case (a, i) => a := false.B } // mptonly to ptw reset all
+    }
+  }
 
   XSPerfAccumulate(s"access", io.r.resp.map(_.valid.asUInt).fold(0.U)(_ + _))
   XSPerfAccumulate(s"hit", io.r.resp.map(a => a.valid && a.bits.hit).fold(0.U)(_.asUInt + _.asUInt))
@@ -295,54 +240,70 @@ class TLBFA(
   println(s"${parentName} tlb_fa: nSets${nSets} nWays:${nWays}")
 }
 
+// TLBFakeFA: Software TLB implementation using DPI-C PteHelper for debug/simulation
+// This module bypasses hardware page table walk and uses C++ reference model instead
 class TLBFakeFA(
-             ports: Int,
-             nDups: Int,
-             nSets: Int,
-             nWays: Int,
-             useDmode: Boolean = false
-           )(implicit p: Parameters) extends TlbModule with HasCSRConst{
+  ports: Int,
+  nDups: Int,
+  nSets: Int,
+  nWays: Int,
+  useDmode: Boolean = false
+)(implicit p: Parameters) extends TlbModule with HasCSRConst {
 
   val io = IO(new TlbStorageIO(nSets, nWays, ports, nDups))
   io.r.req.map(_.ready := true.B)
+
   val mode = if (useDmode) io.csr.priv.dmode else io.csr.priv.imode
-  val vmEnable = if (EnbaleTlbDebug) (io.csr.satp.mode === 8.U)
-    else (io.csr.satp.mode === 8.U && (mode < ModeM))
+  val sv39Enable = io.csr.satp.mode === Sv39
+  val sv48Enable = io.csr.satp.mode === Sv48
+  val sv39vsEnable = io.csr.vsatp.mode === Sv39
+  val sv48vsEnable = io.csr.vsatp.mode === Sv48
+  val sv39x4Enable = io.csr.hgatp.mode === Sv39x4
+  val sv48x4Enable = io.csr.hgatp.mode === Sv48x4
+
+  val vmEnable = if (EnableTlbDebug) (sv39Enable || sv48Enable)
+    else ((sv39Enable || sv48Enable) && (mode < ModeM))
+  val s2xlateEnable = if (EnableTlbDebug) {
+    sv39vsEnable || sv48vsEnable || sv39x4Enable || sv48x4Enable
+  } else {
+    (sv39vsEnable || sv48vsEnable || sv39x4Enable || sv48x4Enable) && (mode < ModeM)
+  }
 
   for (i <- 0 until ports) {
     val req = io.r.req(i)
     val resp = io.r.resp(i)
 
-    val helper = Module(new PTEHelper())
+    val helper = Module(new PteHelper())
     helper.clock := clock
-    helper.satp := io.csr.satp.ppn
-    helper.enable := req.fire && vmEnable
-    helper.vpn := req.bits.vpn
+    helper.connectCsr(io.csr)
 
-    val pte = helper.pte.asTypeOf(new PteBundle)
-    val ppn = pte.ppn
-    val vpn_reg = RegEnable(req.bits.vpn, req.valid)
-    val pf = helper.pf
-    val level = helper.level
+    val helperEnable = req.fire &&
+      Mux(req.bits.s2xlate === noS2xlate, vmEnable, s2xlateEnable) &&
+      !reset.asBool
+    helper.connectReq(req.bits.vpn, req.bits.s2xlate, helperEnable)
 
-    resp.valid := GatedValidRegNext(req.valid)
-    resp.bits.hit := true.B
+    val helperResult = PteHelperResult.fromHelper(helper, helperEnable)
+    val pte = helperResult.pte
+    val s1Pte = helperResult.s1.pte
+    val s2Pte = helperResult.s2.pte
+
+    val vpnReg = RegEnable(req.bits.vpn, req.valid)
+    val s2xlateReg = RegEnable(req.bits.s2xlate, req.valid)
+    val isAllStage = s2xlateReg === allStage
+    val finalPPN = helperResult.finalPPN(vpnReg, s2xlateReg)
+    val s1RespPte = helperResult.s1RespPte(s2xlateReg)
+    val s2RespPte = helperResult.s2RespPte(s2xlateReg)
+
+    resp.valid := RegNext(req.valid)
+    resp.bits.hit := RegNext(helperEnable, false.B)
+
     for (d <- 0 until nDups) {
-      resp.bits.perm(d).pf := pf
-      resp.bits.perm(d).af := false.B
-      resp.bits.perm(d).d := pte.perm.d
-      resp.bits.perm(d).a := pte.perm.a
-      resp.bits.perm(d).g := pte.perm.g
-      resp.bits.perm(d).u := pte.perm.u
-      resp.bits.perm(d).x := pte.perm.x
-      resp.bits.perm(d).w := pte.perm.w
-      resp.bits.perm(d).r := pte.perm.r
-      resp.bits.pbmt(d) := pte.pbmt
-      resp.bits.ppn(d) := MuxLookup(level, 0.U)(Seq(
-        0.U -> Cat(ppn(ppn.getWidth-1, vpnnLen*2), vpn_reg(vpnnLen*2-1, 0)),
-        1.U -> Cat(ppn(ppn.getWidth-1, vpnnLen), vpn_reg(vpnnLen-1, 0)),
-        2.U -> ppn)
-      )
+      resp.bits.perm(d)(s1RespPte, helperResult.hasPf, false.B, Mux(isAllStage, s1Pte.perm.v, helperResult.hasNoPf))
+      resp.bits.pbmt(d) := s1RespPte.pbmt
+      resp.bits.ppn(d) := finalPPN
+      resp.bits.g_perm(d)(s2RespPte, helperResult.hasGpf, false.B, Mux(isAllStage, s2Pte.perm.v, helperResult.hasNoPf))
+      resp.bits.g_pbmt(d) := s2RespPte.pbmt
+      resp.bits.s2xlate(d) := s2xlateReg
     }
   }
 
@@ -353,7 +314,6 @@ object TlbStorage {
   def apply
   (
     parentName: String,
-    associative: String,
     ports: Int,
     nDups: Int = 1,
     nSets: Int,
@@ -381,7 +341,6 @@ class TlbStorageWrapper(ports: Int, q: TLBParameters, nDups: Int = 1)(implicit p
 
   val page = TlbStorage(
     parentName = q.name + "_storage",
-    associative = q.Associative,
     ports = ports,
     nDups = nDups,
     nSets = q.NSets,
@@ -392,41 +351,8 @@ class TlbStorageWrapper(ports: Int, q: TLBParameters, nDups: Int = 1)(implicit p
     SoftTLB = coreParams.softTLB
   )
 
-  for (i <- 0 until ports) {
-    page.r_req_apply(
-      valid = io.r.req(i).valid,
-      vpn = io.r.req(i).bits.vpn,
-      i = i,
-      s2xlate = io.r.req(i).bits.s2xlate
-    )
-  }
-
-  for (i <- 0 until ports) {
-    val q = page.r.req(i)
-    val p = page.r.resp(i)
-    val rq = io.r.req(i)
-    val rp = io.r.resp(i)
-    rq.ready := q.ready // actually, not used
-    rp.valid := p.valid // actually, not used
-    rp.bits.hit := p.bits.hit
-    for (d <- 0 until nDups) {
-      rp.bits.ppn(d) := p.bits.ppn(d)
-      rp.bits.perm(d).pf := p.bits.perm(d).pf
-      rp.bits.perm(d).af := p.bits.perm(d).af
-      rp.bits.perm(d).v := p.bits.perm(d).v
-      rp.bits.perm(d).d := p.bits.perm(d).d
-      rp.bits.perm(d).a := p.bits.perm(d).a
-      rp.bits.perm(d).g := p.bits.perm(d).g
-      rp.bits.perm(d).u := p.bits.perm(d).u
-      rp.bits.perm(d).x := p.bits.perm(d).x
-      rp.bits.perm(d).w := p.bits.perm(d).w
-      rp.bits.perm(d).r := p.bits.perm(d).r
-      rp.bits.s2xlate(d) := p.bits.s2xlate(d)
-      rp.bits.g_perm(d) := p.bits.g_perm(d)
-      rp.bits.pbmt(d) := p.bits.pbmt(d)
-      rp.bits.g_pbmt(d) := p.bits.g_pbmt(d)
-    }
-  }
+  page.r.req <> io.r.req
+  io.r.resp := page.r.resp
 
   page.sfence <> io.sfence
   page.csr <> io.csr
@@ -446,12 +372,4 @@ class TlbStorageWrapper(ports: Int, q: TLBParameters, nDups: Int = 1)(implicit p
     wayIdx = refill_idx,
     data = io.w.bits.data
   )
-
-    // replacement
-  def get_access(one_hot: UInt, valid: Bool): Valid[UInt] = {
-    val res = Wire(Valid(UInt(log2Up(one_hot.getWidth).W)))
-    res.valid := Cat(one_hot).orR && valid
-    res.bits := OHToUInt(one_hot)
-    res
-  }
 }

@@ -8,7 +8,7 @@ import svsim.CommonCompilationSettings.VerilogPreprocessorDefine
 import svsim.verilator.Backend.CompilationSettings.{TraceKind, TraceStyle}
 import org.scalatest.flatspec._
 import org.scalatest.matchers.should._
-import top.{ArgParser, DefaultConfig}
+import top.DefaultConfig
 import xiangshan.backend.regfile.IntPregParams
 
 abstract class XSTester extends AnyFlatSpec with ChiselSim with Matchers {
@@ -20,6 +20,7 @@ abstract class XSTester extends AnyFlatSpec with ChiselSim with Matchers {
       // Example of how to change params
       intPreg = IntPregParams(
         numEntries = 64,
+        numBank = 4,
         numRead = Some(14),
         numWrite = Some(8),
       ),

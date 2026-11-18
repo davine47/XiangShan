@@ -4,202 +4,130 @@ on:
     # run at 15:33 UTC (23:33 UTC+8)
     - cron: '33 15 * * *'
 
+env:
+  FUZZ_NUM: 20 # per json file
+  CKPT_BASE: /nfs/share/checkpoints_profiles
+  CKPT_BASE_LEGACY: /nfs/share/checkpoints_profiles/legacy
+  PROFILE_PATH: /nfs/share/ci-workloads/env-scripts/perf_trigger/profile/data
+  ETA_THRESHOLD: 30000 # do not run checkpoints longer than this, in seconds, see PROFILE_PATH/xxx.json for ETA
+
 jobs:
   build:
-    runs-on: bosc
-    continue-on-error: false
-    # At most 12 hours to finish (before 11:33 UTC+8).
-    timeout-minutes: 720
-    # Build + 8 checkpoints * 1-hour timeout
-    name: Nightly Regression(master) - Checkpoints
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          submodules: true
-      - name: set env
-        run: |
-          export HEAD_SHA=${{ github.run_number }}
-          echo "NOOP_HOME=$GITHUB_WORKSPACE" >> $GITHUB_ENV
-          echo "NEMU_HOME=/nfs/home/share/ci-workloads/NEMU" >> $GITHUB_ENV
-          echo "PERF_HOME=/nfs/home/ci-runner/xs-perf/${HEAD_SHA}" >> $GITHUB_ENV
-          echo "WAVE_HOME=/nfs/home/ci-runner/xs-wave/${HEAD_SHA}" >> $GITHUB_ENV
-          echo "GCPT_RESTORE_BIN=/nfs/home/share/ci-workloads/fix-gcpt/gcpt.bin" >> $GITHUB_ENV
-          mkdir -p /nfs/home/ci-runner/xs-perf/${HEAD_SHA}
-          mkdir -p /nfs/home/ci-runner/xs-wave/${HEAD_SHA}
-      - name: Initialize submodules
-        run: make init-force
-      - name: clean up
-        run: |
-          python3 $GITHUB_WORKSPACE/scripts/xiangshan.py --clean
-      - name: Build EMU with DRAMsim3 and Spike-Diff
-        run: |
-          python3 $GITHUB_WORKSPACE/scripts/xiangshan.py --build          \
-            --dramsim3 /nfs/home/share/ci-workloads/DRAMsim3              \
-            --with-dramsim3 --threads 16 --spike                          \
-            --pgo $GITHUB_WORKSPACE/ready-to-run/coremark-2-iteration.bin \
-            --llvm-profdata llvm-profdata --trace-fst
-      - name: Random Checkpoint 0
-        run: |
-          python3 $GITHUB_WORKSPACE/scripts/xiangshan.py           \
-            --wave-dump $WAVE_HOME --threads 16 --numa             \
-            --spike --ci random --timeout 3600 --ram-size=16GB     \
-            --gcpt-restore-bin $GCPT_RESTORE_BIN                   \
-            2> perf.log
-          cat perf.log | sort | tee $PERF_HOME/random_0.txt
-      - name: Random Checkpoint 1
-        run: |
-          python3 $GITHUB_WORKSPACE/scripts/xiangshan.py           \
-            --wave-dump $WAVE_HOME --threads 16 --numa             \
-            --spike --ci random --timeout 3600 --ram-size=16GB     \
-            --gcpt-restore-bin $GCPT_RESTORE_BIN                   \
-            2> perf.log
-          cat perf.log | sort | tee $PERF_HOME/random_1.txt
-      - name: Random Checkpoint 2
-        run: |
-          python3 $GITHUB_WORKSPACE/scripts/xiangshan.py           \
-            --wave-dump $WAVE_HOME --threads 16 --numa             \
-            --spike --ci random --timeout 3600 --ram-size=16GB     \
-            --gcpt-restore-bin $GCPT_RESTORE_BIN                   \
-            2> perf.log
-          cat perf.log | sort | tee $PERF_HOME/random_2.txt
-      - name: Random Checkpoint 3
-        run: |
-          python3 $GITHUB_WORKSPACE/scripts/xiangshan.py           \
-            --wave-dump $WAVE_HOME --threads 16 --numa             \
-            --spike --ci random --timeout 3600 --ram-size=16GB     \
-            --gcpt-restore-bin $GCPT_RESTORE_BIN                   \
-            2> perf.log
-          cat perf.log | sort | tee $PERF_HOME/random_3.txt
-      - name: Random Checkpoint 4
-        run: |
-          python3 $GITHUB_WORKSPACE/scripts/xiangshan.py           \
-            --wave-dump $WAVE_HOME --threads 16 --numa             \
-            --spike --ci random --timeout 3600 --ram-size=16GB     \
-            --gcpt-restore-bin $GCPT_RESTORE_BIN                   \
-            2> perf.log
-          cat perf.log | sort | tee $PERF_HOME/random_4.txt
-      - name: Random Checkpoint 5
-        run: |
-          python3 $GITHUB_WORKSPACE/scripts/xiangshan.py           \
-            --wave-dump $WAVE_HOME --threads 16 --numa             \
-            --spike --ci random --timeout 3600 --ram-size=16GB     \
-            --gcpt-restore-bin $GCPT_RESTORE_BIN                   \
-            2> perf.log
-          cat perf.log | sort | tee $PERF_HOME/random_5.txt
-      - name: Random Checkpoint 6
-        run: |
-          python3 $GITHUB_WORKSPACE/scripts/xiangshan.py           \
-            --wave-dump $WAVE_HOME --threads 16 --numa             \
-            --spike --ci random --timeout 3600 --ram-size=16GB     \
-            --gcpt-restore-bin $GCPT_RESTORE_BIN                   \
-            2> perf.log
-          cat perf.log | sort | tee $PERF_HOME/random_6.txt
-      - name: Random Checkpoint 7
-        run: |
-          python3 $GITHUB_WORKSPACE/scripts/xiangshan.py           \
-            --wave-dump $WAVE_HOME --threads 16 --numa             \
-            --spike --ci random --timeout 3600 --ram-size=16GB     \
-            --gcpt-restore-bin $GCPT_RESTORE_BIN                   \
-            2> perf.log
-          cat perf.log | sort | tee $PERF_HOME/random_7.txt
+    name: Build EMU
+    uses: ./.github/workflows/perf-build.yml
+    with:
+      test_branch: kunminghu-v3
 
-  build-v3:
-      runs-on: bosc
-      continue-on-error: false
-      # At most 12 hours to finish (before 11:33 UTC+8).
-      timeout-minutes: 720
-      # Build + 8 checkpoints * 1-hour timeout
-      name: Nightly Regression(kunminghu-v3) - Checkpoints
-      steps:
-        - uses: actions/checkout@v4
-          with:
-            ref: kunminghu-v3
-            fetch-depth: 0
-            submodules: true
-        - name: set env
-          run: |
-            export HEAD_SHA=${{ github.run_number }}
-            echo "NOOP_HOME=$GITHUB_WORKSPACE" >> $GITHUB_ENV
-            echo "NEMU_HOME=/nfs/home/share/ci-workloads/NEMU" >> $GITHUB_ENV
-            echo "PERF_HOME=/nfs/home/ci-runner/xs-perf/${HEAD_SHA}" >> $GITHUB_ENV
-            echo "WAVE_HOME=/nfs/home/ci-runner/xs-wave/${HEAD_SHA}" >> $GITHUB_ENV
-            echo "GCPT_RESTORE_BIN=/nfs/home/share/ci-workloads/fix-gcpt/gcpt.bin" >> $GITHUB_ENV
-            mkdir -p /nfs/home/ci-runner/xs-perf/${HEAD_SHA}
-            mkdir -p /nfs/home/ci-runner/xs-wave/${HEAD_SHA}
-        - name: Initialize submodules
-          run: make init-force
-        - name: clean up
-          run: |
-            python3 $GITHUB_WORKSPACE/scripts/xiangshan.py --clean
-        - name: Build EMU with DRAMsim3 and Spike-Diff
-          run: |
-            python3 $GITHUB_WORKSPACE/scripts/xiangshan.py --build          \
-              --dramsim3 /nfs/home/share/ci-workloads/DRAMsim3              \
-              --with-dramsim3 --threads 16 --spike                          \
-              --pgo $GITHUB_WORKSPACE/ready-to-run/coremark-2-iteration.bin \
-              --llvm-profdata llvm-profdata --trace-fst
-        - name: Random Checkpoint 0
-          run: |
-            python3 $GITHUB_WORKSPACE/scripts/xiangshan.py           \
-              --wave-dump $WAVE_HOME --threads 16 --numa             \
-              --spike --ci random --timeout 3600 --ram-size=16GB     \
-              --gcpt-restore-bin $GCPT_RESTORE_BIN                   \
-              2> perf.log
-            cat perf.log | sort | tee $PERF_HOME/random_0.txt
-        - name: Random Checkpoint 1
-          run: |
-            python3 $GITHUB_WORKSPACE/scripts/xiangshan.py           \
-              --wave-dump $WAVE_HOME --threads 16 --numa             \
-              --spike --ci random --timeout 3600 --ram-size=16GB     \
-              --gcpt-restore-bin $GCPT_RESTORE_BIN                   \
-              2> perf.log
-            cat perf.log | sort | tee $PERF_HOME/random_1.txt
-        - name: Random Checkpoint 2
-          run: |
-            python3 $GITHUB_WORKSPACE/scripts/xiangshan.py           \
-              --wave-dump $WAVE_HOME --threads 16 --numa             \
-              --spike --ci random --timeout 3600 --ram-size=16GB     \
-              --gcpt-restore-bin $GCPT_RESTORE_BIN                   \
-              2> perf.log
-            cat perf.log | sort | tee $PERF_HOME/random_2.txt
-        - name: Random Checkpoint 3
-          run: |
-            python3 $GITHUB_WORKSPACE/scripts/xiangshan.py           \
-              --wave-dump $WAVE_HOME --threads 16 --numa             \
-              --spike --ci random --timeout 3600 --ram-size=16GB     \
-              --gcpt-restore-bin $GCPT_RESTORE_BIN                   \
-              2> perf.log
-            cat perf.log | sort | tee $PERF_HOME/random_3.txt
-        - name: Random Checkpoint 4
-          run: |
-            python3 $GITHUB_WORKSPACE/scripts/xiangshan.py           \
-              --wave-dump $WAVE_HOME --threads 16 --numa             \
-              --spike --ci random --timeout 3600 --ram-size=16GB     \
-              --gcpt-restore-bin $GCPT_RESTORE_BIN                   \
-              2> perf.log
-            cat perf.log | sort | tee $PERF_HOME/random_4.txt
-        - name: Random Checkpoint 5
-          run: |
-            python3 $GITHUB_WORKSPACE/scripts/xiangshan.py           \
-              --wave-dump $WAVE_HOME --threads 16 --numa             \
-              --spike --ci random --timeout 3600 --ram-size=16GB     \
-              --gcpt-restore-bin $GCPT_RESTORE_BIN                   \
-              2> perf.log
-            cat perf.log | sort | tee $PERF_HOME/random_5.txt
-        - name: Random Checkpoint 6
-          run: |
-            python3 $GITHUB_WORKSPACE/scripts/xiangshan.py           \
-              --wave-dump $WAVE_HOME --threads 16 --numa             \
-              --spike --ci random --timeout 3600 --ram-size=16GB     \
-              --gcpt-restore-bin $GCPT_RESTORE_BIN                   \
-              2> perf.log
-            cat perf.log | sort | tee $PERF_HOME/random_6.txt
-        - name: Random Checkpoint 7
-          run: |
-            python3 $GITHUB_WORKSPACE/scripts/xiangshan.py           \
-              --wave-dump $WAVE_HOME --threads 16 --numa             \
-              --spike --ci random --timeout 3600 --ram-size=16GB     \
-              --gcpt-restore-bin $GCPT_RESTORE_BIN                   \
-              2> perf.log
-            cat perf.log | sort | tee $PERF_HOME/random_7.txt
+  run:
+    name: Run Performance Test
+    needs: build
+    uses: ./.github/workflows/perf-run.yml
+    with:
+      spec_dir: ${{ needs.build.outputs.SPEC_DIR }}
+      benchmark_type: spec06-rva23-novec-gcc16-0.3c
+      servers: all
+
+  select:
+    name: Select random checkpoints
+    needs: build
+    runs-on: perf
+    outputs:
+      RESULT_PATH: ${{ steps.select.outputs.RESULT_PATH }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.build.outputs.COMMIT_SHA }}
+      - name: Select random checkpoints
+        id: select
+        run: |
+          # NOTE: make sure the following does not contain the default nightly 0.3c checkpoints
+          RESULT_LIST=$(python3 $GITHUB_WORKSPACE/.github/workflows/ckpt_select.py \
+            --output list \
+            --seed ${{ github.run_number }} \
+            --profile "${PROFILE_PATH}" \
+            --eta-threshold "${ETA_THRESHOLD}" \
+            --random ":${FUZZ_NUM}:${CKPT_BASE_LEGACY}/spec06_rv64gcb_O3_20m_gcc12.2.0-intFpcOff-jeMalloc/checkpoint-0-0-0/cluster-0-0-int.json" \
+            --random ":${FUZZ_NUM}:${CKPT_BASE_LEGACY}/spec06_gcc15_rv64gcb_base_260122/checkpoint-0-0-0/cluster-0-0.json" \
+            --random ":${FUZZ_NUM}:${CKPT_BASE_LEGACY}/spec06_xscc_v1_rv64gcb_base_260122/checkpoint-0-0-0/cluster-0-0.json" \
+            --random ":${FUZZ_NUM}:${CKPT_BASE_LEGACY}/spec06_gcc15_rv64gcb_base_260604/json/checkpoints_all.json" \
+            --random ":${FUZZ_NUM}:${CKPT_BASE_LEGACY}/spec06_xscc_rva23_novec_260911/json/checkpoints_all.json" \
+            --random ":${FUZZ_NUM}:${CKPT_BASE}/spec06_xscc_rv64gcb_261013/checkpoint-0-0-0/cluster-0-0.json" \
+            --random ":${FUZZ_NUM}:${CKPT_BASE}/spec17_rate_gcc16_rva23_novec_260904/json/checkpoints_all.json" \
+            --random ":${FUZZ_NUM}:${CKPT_BASE}/spec17_rate_xscc_rva23_novec_261011/json/checkpoints_all.json" \
+            --random ":${FUZZ_NUM}:${CKPT_BASE}/spec26_rate_gcc15_rv64gcb_260718/json/checkpoints_all.json" \
+          )
+          # save list
+          RESULT_PATH="${{ needs.build.outputs.SPEC_DIR }}/fuzz-$(date '+%y%m%d').f"
+          mkdir -p "${{ needs.build.outputs.SPEC_DIR }}"
+          echo "${RESULT_LIST}" > "${RESULT_PATH}"
+          echo "RESULT_PATH=${RESULT_PATH}" >> "$GITHUB_OUTPUT"
+          # display to log
+          echo "Selected checkpoints:"
+          cat "${RESULT_PATH}"
+
+  run-fuzz:
+    needs:
+      - build
+      - select
+    name: Run Fuzz Test
+    uses: ./.github/workflows/perf-run.yml
+    with:
+      spec_dir: ${{ needs.build.outputs.SPEC_DIR }}
+      benchmark_type: custom
+      json_path: ${{ needs.select.outputs.RESULT_PATH }}
+      servers: all
+      artifact_name: fuzz-report
+
+  report:
+    name: Generate Report
+    needs:
+      - build
+      - run
+    runs-on: perf
+    steps:
+      - uses: actions/checkout@v7
+      - name: Link current report
+        run: |
+          if [ ! -L "/nfs/home/cirunner/perf-report/nightly-${{ needs.build.outputs.DATE }}" ]; then
+            ln -s "${{ needs.build.outputs.SPEC_DIR }}" "/nfs/home/cirunner/perf-report/nightly-${{ needs.build.outputs.DATE }}"
+          else
+            echo "Symlink already exists"
+          fi
+      - name: Find previous commit
+        run: |
+          PREV_DIR=$(find "/nfs/home/cirunner/perf-report" -maxdepth 1 -name "nightly-*" ! -name "nightly-${{ needs.build.outputs.DATE }}" | sort | tail -n1)
+          echo "Found previous report: $PREV_DIR"
+          PREV_DIR=$(readlink -f "$PREV_DIR" || true)
+          echo "Resolved to: $PREV_DIR"
+          echo "PREV_DIR=$PREV_DIR" >> $GITHUB_ENV
+      - name: Diff with previous result
+        run: |
+          echo "### :bar_chart: Diff with previous run" >> $GITHUB_STEP_SUMMARY
+
+          echo "NOTE: This report is not maintained."
+          echo "NOTE: Consider using https://dashboard.xiangshan.cc to view nightly diff results." >> $GITHUB_STEP_SUMMARY
+
+          CURR_SCORE_FILE="${{ needs.run.outputs.SCORE_FILE }}"
+          PREV_SCORE_FILE="$PREV_DIR/$(basename ${{ needs.run.outputs.SCORE_FILE }})"
+
+          if [ -z "${PREV_DIR}" ] || [ ! -d "${PREV_DIR}" ]; then
+            echo "${PREV_DIR} does not exist" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+          if [ ! -f "${PREV_SCORE_FILE}" ]; then
+            echo "${PREV_SCORE_FILE} not found, falling back"
+            PREV_SCORE_FILE_FALLBACK="$(find "${PREV_DIR}" -type f -name "score*.txt" | head -n1)"
+            if [ -z "${PREV_SCORE_FILE_FALLBACK}" ]; then
+              echo "No previous score file found, tried:" >> $GITHUB_STEP_SUMMARY
+              echo "- ${PREV_SCORE_FILE}" >> $GITHUB_STEP_SUMMARY
+              echo "- find score*.txt in ${PREV_DIR}" >> $GITHUB_STEP_SUMMARY
+              exit 0
+            fi
+            echo "${PREV_SCORE_FILE} not found, fall back to ${PREV_SCORE_FILE_FALLBACK}" >> $GITHUB_STEP_SUMMARY
+            PREV_SCORE_FILE="${PREV_SCORE_FILE_FALLBACK}"
+          fi
+
+          echo "Current: ${CURR_SCORE_FILE}" >> $GITHUB_STEP_SUMMARY
+          echo "Previous: ${PREV_SCORE_FILE}" >> $GITHUB_STEP_SUMMARY
+          python3 $GITHUB_WORKSPACE/.github/workflows/nightly_perf_diff.py "${CURR_SCORE_FILE}" "${PREV_SCORE_FILE}" >> $GITHUB_STEP_SUMMARY

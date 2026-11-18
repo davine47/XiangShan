@@ -1,11 +1,14 @@
 package xiangshan.backend.issue
 
+import chisel3.Bundle
 import org.chipsalliance.cde.config.Parameters
 import chisel3.util._
 import xiangshan.backend.BackendParams
 import xiangshan.backend.Bundles._
+import xiangshan.backend.datapath.DataConfig._
 import xiangshan.backend.datapath.WakeUpSource
 import xiangshan.backend.datapath.WbConfig.PregWB
+import xiangshan.backend.exu.ExeUnitParams
 
 sealed trait SchedulerType
 
@@ -33,6 +36,8 @@ case class SchdBlockParams(
 
   def JmpCnt: Int = issueBlockParams.map(_.JmpCnt).sum
 
+  def LinkCnt: Int = issueBlockParams.map(_.LinkCnt).sum
+
   def BrhCnt: Int = issueBlockParams.map(_.BrhCnt).sum
 
   def I2fCnt: Int = issueBlockParams.map(_.I2fCnt).sum
@@ -51,8 +56,6 @@ case class SchdBlockParams(
 
   def VsetCnt: Int = issueBlockParams.map(_.VsetCnt).sum
 
-  def FmacCnt: Int = issueBlockParams.map(_.FmacCnt).sum
-
   def FDivSqrtCnt: Int = issueBlockParams.map(_.fDivSqrtCnt).sum
 
   def LduCnt: Int = issueBlockParams.map(_.LduCnt).sum
@@ -66,12 +69,6 @@ case class SchdBlockParams(
   def HyuCnt: Int = issueBlockParams.map(_.HyuCnt).sum
 
   def LdExuCnt: Int = issueBlockParams.map(_.LdExuCnt).sum
-
-  def VipuCnt: Int = issueBlockParams.map(_.VipuCnt).sum
-
-  def VlduCnt: Int = issueBlockParams.map(_.VlduCnt).sum
-
-  def VstuCnt: Int = issueBlockParams.map(_.VstuCnt).sum
 
   def numExu: Int = issueBlockParams.map(_.exuBlockParams.count(!_.fakeUnit)).sum
 
@@ -102,7 +99,7 @@ case class SchdBlockParams(
   def needSrcVxrm: Boolean = issueBlockParams.map(_.needSrcVxrm).reduce(_ || _)
 
   def writeVConfig: Boolean = issueBlockParams.map(_.writeVConfig).reduce(_ || _)
-  
+
   def writeVType: Boolean = issueBlockParams.map(_.writeVType).reduce(_ || _)
 
   def numRedirect: Int = issueBlockParams.map(_.numRedirect).sum
@@ -127,24 +124,97 @@ case class SchdBlockParams(
 
   def needWriteRegCache: Boolean = numWriteRegCache > 0
 
+  def genOg1InUopBundle(implicit p: Parameters): MixedVec[MixedVec[DecoupledIO[Og1InUop]]] = {
+    MixedVec(this.issueBlockParams.map(_.genOg1InUopDecoupledBundle))
+  }
+
   def genExuInputBundle(implicit p: Parameters): MixedVec[MixedVec[DecoupledIO[ExuInput]]] = {
     MixedVec(this.issueBlockParams.map(_.genExuInputDecoupledBundle))
   }
 
+  def genExuInputBundle[T <: Bundle](
+    builder: ExuInput => T,
+    when: ExeUnitParams => Boolean,
+  )(implicit p: Parameters): MixedVec[MixedVec[T]] = {
+    MixedVec(
+      this.issueBlockParams
+        .filter(_.exuBlockParams.exists(when))
+        .map(
+          x => MixedVec(
+            x.exuBlockParams
+              .filter(when)
+              .map(xx => builder(xx.genExuInputBundle))
+          )
+        )
+    )
+  }
+
+  def genNewExuInputBundle[T <: Bundle](
+    builder: NewExuInput => T,
+    when: ExeUnitParams => Boolean,
+  )(implicit p: Parameters): MixedVec[MixedVec[T]] = {
+    MixedVec(
+      this.issueBlockParams
+        .filter(_.exuBlockParams.exists(when))
+        .map(
+          x => MixedVec(
+            x.exuBlockParams
+              .filter(when)
+              .map(xx => builder(xx.genNewExuInputBundle))
+          )
+        )
+    )
+  }
+
   def genExuInputCopySrcBundle(implicit p: Parameters): MixedVec[MixedVec[DecoupledIO[ExuInput]]] = {
-    MixedVec(this.issueBlockParams.map(_.genExuInputDecoupledCopySrcBundle))
+    MixedVec(this.issueBlockParams.map(_.genExuInputDecoupledBundle))
+  }
+
+  def genNewExuInputCopySrcBundle(implicit p: Parameters): MixedVec[MixedVec[DecoupledIO[NewExuInput]]] = {
+    MixedVec(this.issueBlockParams.map(_.genNewExuInputDecoupledBundle))
   }
 
   def genExuInputCopySrcBundleMemBlock(implicit p: Parameters): MixedVec[MixedVec[DecoupledIO[ExuInput]]] = {
-    MixedVec(this.issueBlockParams.filter(_.isMemBlockIQ).map(_.genExuInputDecoupledCopySrcBundle))
+    MixedVec(this.issueBlockParams.filter(_.isMemBlockIQ).map(_.genExuInputDecoupledBundle))
+  }
+
+  def genNewExuOutputBundle[T <: Bundle](
+    builder: NewExuOutput => T,
+    when: ExeUnitParams => Boolean,
+  )(implicit p: Parameters): MixedVec[MixedVec[T]] = {
+    MixedVec(this.issueBlockParams.filter(_.exuBlockParams.exists(when)).map(_.genNewExuOutputBundle(builder)))
+  }
+
+  def genNewExuInputCopySrcBundleMemBlock(implicit p: Parameters): MixedVec[MixedVec[DecoupledIO[NewExuInput]]] = {
+    MixedVec(this.issueBlockParams.filter(_.isMemBlockIQ).map(_.genNewExuInputDecoupledBundle))
+  }
+
+  def genMemWakeupLRQBundle(implicit p: Parameters): MixedVec[MixedVec[ValidIO[IssueQueueLRQWakeUpBundle]]] = {
+    MixedVec(this.issueBlockParams.filter(_.isStoreIQ).map(_.genMemWakeupLRQBundle))
+  }
+
+  def genMemWakeupCancelBundle(implicit p: Parameters): MixedVec[MixedVec[IssueQueueLRQWakeUpCancelBundle]] = {
+    MixedVec(this.issueBlockParams.filter(_.isStoreIQ).map(_.genMemWakeupCancelBundle))
   }
 
   def genExuOutputDecoupledBundle(implicit p: Parameters): MixedVec[MixedVec[DecoupledIO[ExuOutput]]] = {
     MixedVec(this.issueBlockParams.map(_.genExuOutputDecoupledBundle))
   }
 
+  def genNewExuOutputDecoupledBundle(implicit p: Parameters): MixedVec[MixedVec[DecoupledIO[NewExuOutput]]] = {
+    MixedVec(this.issueBlockParams.map(_.genNewExuOutputDecoupledBundle))
+  }
+
   def genExuOutputDecoupledBundleMemBlock(implicit p: Parameters): MixedVec[MixedVec[DecoupledIO[ExuOutput]]] = {
     MixedVec(this.issueBlockParams.filter(_.isMemBlockIQ).map(_.genExuOutputDecoupledBundle))
+  }
+
+  def genNewExuOutputDecoupledBundleMemBlock(implicit p: Parameters): MixedVec[MixedVec[DecoupledIO[NewExuOutput]]] = {
+    MixedVec(this.issueBlockParams.filter(_.isMemBlockIQ).map(_.genNewExuOutputDecoupledBundle))
+  }
+
+  def genMemWriteBackBundle(implicit p: Parameters): MixedVec[MixedVec[MemWriteBack]] = {
+    MixedVec(this.issueBlockParams.filter(_.isMemBlockIQ).map(_.genMemWriteBackBundle))
   }
 
   def genExuOutputDecoupledBundleLoad(implicit p: Parameters): MixedVec[MixedVec[DecoupledIO[ExuOutput]]] = {
@@ -152,15 +222,31 @@ case class SchdBlockParams(
   }
 
   def genExuInputCopySrcBundleNoMemBlock(implicit p: Parameters): MixedVec[MixedVec[DecoupledIO[ExuInput]]] = {
-    MixedVec(this.issueBlockParams.filterNot(_.isMemBlockIQ).map(_.genExuInputDecoupledCopySrcBundle))
+    MixedVec(this.issueBlockParams.filterNot(_.isMemBlockIQ).map(_.genExuInputDecoupledBundle))
+  }
+
+  def genNewExuInputCopySrcBundleNoMemBlock(implicit p: Parameters): MixedVec[MixedVec[DecoupledIO[NewExuInput]]] = {
+    MixedVec(this.issueBlockParams.filterNot(_.isMemBlockIQ).map(_.genNewExuInputDecoupledBundle))
   }
 
   def genExuOutputDecoupledBundleNoMemBlock(implicit p: Parameters): MixedVec[MixedVec[DecoupledIO[ExuOutput]]] = {
     MixedVec(this.issueBlockParams.filterNot(_.isMemBlockIQ).map(_.genExuOutputDecoupledBundle))
   }
 
+  def genNewExuOutputDecoupledBundleNoMemBlock(implicit p: Parameters): MixedVec[MixedVec[DecoupledIO[NewExuOutput]]] = {
+    MixedVec(this.issueBlockParams.filterNot(_.isMemBlockIQ).map(_.genNewExuOutputDecoupledBundle))
+  }
+
   def genExuOutputValidBundle(implicit p: Parameters): MixedVec[MixedVec[ValidIO[ExuOutput]]] = {
     MixedVec(this.issueBlockParams.map(_.genExuOutputValidBundle))
+  }
+
+  def genNewExuOutputValidBundle(implicit p: Parameters): MixedVec[MixedVec[ValidIO[NewExuOutput]]] = {
+    MixedVec(this.issueBlockParams.map(_.genNewExuOutputValidBundle))
+  }
+
+  def genWriteBackRobValidBundle(needExtraVld: Boolean)(implicit p: Parameters): MixedVec[MixedVec[ValidIO[WriteBackRobBundle]]] = {
+    MixedVec(this.issueBlockParams.map(_.genWriteBackRobValidBundle(needExtraVld = needExtraVld)))
   }
 
   def genExuBypassValidBundle(implicit p: Parameters): MixedVec[MixedVec[ValidIO[ExuBypassBundle]]] = {
@@ -201,23 +287,23 @@ case class SchdBlockParams(
 
   def genWBWakeUpSinkValidBundle(implicit p: Parameters): MixedVec[ValidIO[IssueQueueWBWakeUpBundle]] = {
     val intBundle: Seq[ValidIO[IssueQueueWBWakeUpBundle]] = schdType match {
-      case IntScheduler() => backendParam.getIntWBExeGroup.map(x => ValidIO(new IssueQueueWBWakeUpBundle(x._2.map(_.exuIdx), backendParam))).toSeq
+      case IntScheduler() => backendParam.getIntWBExeGroup.map(x => ValidIO(new IssueQueueWBWakeUpBundle(x._2.map(_.exuIdx), backendParam, IntData()))).toSeq
       case _ => Seq()
     }
     val fpBundle: Seq[ValidIO[IssueQueueWBWakeUpBundle]] = schdType match {
-      case FpScheduler() => backendParam.getIntWBExeGroup.map(x => ValidIO(new IssueQueueWBWakeUpBundle(x._2.map(_.exuIdx), backendParam))).toSeq
+      case FpScheduler() => backendParam.getIntWBExeGroup.map(x => ValidIO(new IssueQueueWBWakeUpBundle(x._2.map(_.exuIdx), backendParam, FpData()))).toSeq
       case _ => Seq()
     }
     val vfBundle = schdType match {
-      case VecScheduler() => backendParam.getVfWBExeGroup.map(x => ValidIO(new IssueQueueWBWakeUpBundle(x._2.map(_.exuIdx), backendParam))).toSeq
+      case VecScheduler() => backendParam.getVfWBExeGroup.map(x => ValidIO(new IssueQueueWBWakeUpBundle(x._2.map(_.exuIdx), backendParam, VecData()))).toSeq
       case _ => Seq()
     }
     val v0Bundle = schdType match {
-      case VecScheduler() => backendParam.getV0WBExeGroup.map(x => ValidIO(new IssueQueueWBWakeUpBundle(x._2.map(_.exuIdx), backendParam))).toSeq
+      case VecScheduler() => backendParam.getV0WBExeGroup.map(x => ValidIO(new IssueQueueWBWakeUpBundle(x._2.map(_.exuIdx), backendParam, V0Data()))).toSeq
       case _ => Seq()
     }
     val vlBundle = schdType match {
-      case VecScheduler() => backendParam.getVlWBExeGroup.map(x => ValidIO(new IssueQueueWBWakeUpBundle(x._2.map(_.exuIdx), backendParam))).toSeq
+      case VecScheduler() => backendParam.getVlWBExeGroup.map(x => ValidIO(new IssueQueueWBWakeUpBundle(x._2.map(_.exuIdx), backendParam, VlData()))).toSeq
       case _ => Seq()
     }
     MixedVec(intBundle ++ fpBundle ++ vfBundle ++ v0Bundle ++ vlBundle)

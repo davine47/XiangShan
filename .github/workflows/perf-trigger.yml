@@ -1,0 +1,128 @@
+name: Performance Regression Trigger
+
+run-name: "${{ github.event.inputs.note }} - ${{ github.event.inputs.test_branch }} - ${{ github.event.inputs.benchmark_type }} - ${{ github.event.inputs.xs_config }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      note:
+        description: Test note, will be displayed in the title
+        required: false
+        type: string
+        default: Performance Regression
+      test_branch:
+        description: Branch or commit to run performance test on
+        required: false
+        type: string
+        default: kunminghu-v3
+      emulator:
+        description: emulator to use
+        required: false
+        type: choice
+        options:
+          - gsim
+          - verilator
+        default: gsim
+      xs_config:
+        description: Config for XiangShan core
+        required: false
+        type: choice
+        options:
+          - DefaultConfig
+          - BackendV2Config
+          - KunminghuV2Config
+        default: DefaultConfig
+      benchmark_type:
+        description: Benchmark type
+        required: false
+        type: choice
+        options:
+          - spec06-rva23-novec-gcc16-0.3c
+          - spec06-rva23-novec-gcc16-1.0c
+          - spec06-rv64gcb-xscc-1.0c
+          - spec17-rva23-novec-gcc16-0.3c
+          - spec17-rva23-novec-gcc16-1.0c
+          - spec17-rva23-novec-xscc-0.3c
+          - spec17-rva23-novec-xscc-1.0c
+          - spec26-gcc15-0.3c
+          - spec26-gcc15-1.0c
+          - custom
+        default: spec06-rva23-novec-gcc16-1.0c
+      benchmarks:
+        description: Specific benchmarks to run (comma-separated), leave empty to run all
+        required: false
+        type: string
+      cst_file:
+        description: Constantin file path (empty for default init setting, or file path for specific file)
+        required: false
+        type: string
+      disable_diff:
+        description: Disable difftest
+        required: false
+        type: boolean
+        default: false
+      enable_db:
+        description: Enable ChiselDB dump (High disk usage, 4~16G/ckpt, use with caution!)
+        required: false
+        type: boolean
+        default: false
+      enable_rolling:
+        description: Enable rolling DB dump, which implies enable_db (High disk usage, 4~16G/ckpt, use with caution!)
+        required: false
+        type: boolean
+        default: false
+      servers:
+        description: Servers to run emulation on, leave empty to let the script select
+        required: false
+        type: string
+      checkpoint_path:
+        description: "Custom checkpoint directory. Empty: json_path is a workload list"
+        required: false
+        type: string
+      json_path:
+        description: Custom JSON, or workload list if checkpoint_path is empty
+        required: false
+        type: string
+      warmup:
+        description: emu -W (default 20000000)
+        required: false
+        type: string
+      max_instr:
+        description: emu -I (default 40000000)
+        required: false
+        type: string
+      max_cycles:
+        description: emu -C (omit for unlimited)
+        required: false
+        type: string
+
+jobs:
+  build:
+    uses: ./.github/workflows/perf-build.yml
+    with:
+        test_branch: ${{ github.event.inputs.test_branch }}
+        emulator: ${{ github.event.inputs.emulator }}
+        xs_config: ${{ github.event.inputs.xs_config }}
+        cst_file: ${{ github.event.inputs.cst_file }}
+        disable_diff: ${{ fromJSON(github.event.inputs.disable_diff) }}
+        enable_db: ${{ fromJSON(github.event.inputs.enable_db) }}
+        enable_rolling: ${{ fromJSON(github.event.inputs.enable_rolling) }}
+
+  run:
+    needs: build
+    uses: ./.github/workflows/perf-run.yml
+    with:
+        spec_dir: ${{ needs.build.outputs.SPEC_DIR }}
+        emulator: ${{ github.event.inputs.emulator }}
+        benchmark_type: ${{ github.event.inputs.benchmark_type }}
+        benchmarks: ${{ github.event.inputs.benchmarks }}
+        cst_file: ${{ needs.build.outputs.CST_FILE }}
+        disable_diff: ${{ fromJSON(github.event.inputs.disable_diff) }}
+        enable_db: ${{ fromJSON(github.event.inputs.enable_db) }}
+        enable_rolling: ${{ fromJSON(github.event.inputs.enable_rolling) }}
+        servers: ${{ github.event.inputs.servers }}
+        checkpoint_path: ${{ github.event.inputs.checkpoint_path }}
+        json_path: ${{ github.event.inputs.json_path }}
+        warmup: ${{ github.event.inputs.warmup }}
+        max_instr: ${{ github.event.inputs.max_instr }}
+        max_cycles: ${{ github.event.inputs.max_cycles }}

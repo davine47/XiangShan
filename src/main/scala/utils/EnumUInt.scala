@@ -129,7 +129,7 @@ abstract class EnumUInt(
         s"EnumUInt ${this.getClass.getName} has duplicate value(${litValue}): ${name} and ${this.names(dupIdx)}."
       )
       assert( // check3.1: one-hot values must be power of 2
-        !useOneHot || isPow2(litValue),
+        !useOneHot || (if (allowZeroForOneHot) litValue == 0 || isPow2(litValue) else isPow2(litValue)),
         s"EnumUInt ${this.getClass.getName} using one-hot has non one-hot value(${litValue}): ${name}."
       )
       assert( // check3.2: one-hot values must not be 0
@@ -213,6 +213,60 @@ abstract class EnumUInt(
         that // that is a hardware Wire/Reg, we cannot use litValue
       )
     }
+
+  /**
+   * Get valid vector (or cartesian product with thatVec) for the enum value
+   * @example {{{
+   *   object ThisEnum extends EnumUInt(3) {
+   *     def X: UInt = 0.U(width.W)
+   *     def Y: UInt = 1.U(width.W)
+   *     def Z: UInt = 2.U(width.W)
+   *   }
+   *   val thisValue = WireDefault(ThisEnum.X)
+   *
+   *   object ThatEnum extends EnumUInt(2) {
+   *     def A: UInt = 0.U(width.W)
+   *     def B: UInt = 1.U(width.W)
+   *   }
+   *   val thatValue = WireDefault(ThatEnum.B)
+   *   val thatSeq = ThatEnum.getValidSeq(thatValue, thisPrefix = "thatIs")
+   *   // thatSeq = Seq(
+   *   //   "thatIsA" -> false.B,
+   *   //   "thatIsB" -> true.B // thatValue === ThatEnum.B
+   *   // )
+   *
+   *   val crossSeq = ThisEnum.getValidSeq(thisValue, thatSeq = thatSeq, exclude = "Z", thisPrefix = "thisIs")
+   *   // crossSeq = Seq(
+   *   //   "thatIsA_thisIsX" -> false.B,
+   *   //   "thatIsA_thisIsY" -> false.B,
+   *   //   "thatIsB_thisIsX" -> true.B, // thatValue === ThatEnum.B && thisValue === ThisEnum.X
+   *   //   "thatIsB_thisIsY" -> false.B
+   *   // )
+   * }}}
+   */
+  def getValidSeq(
+      value:      UInt,
+      thatSeq:    Seq[(String, Bool)] = Seq.empty,
+      exclude:    Set[String] = Set.empty,
+      thisPrefix: String = ""
+  ): Seq[(String, Bool)] = {
+    exclude.filter(name => !this.names.contains(name)).foreach { name =>
+      println(s"[Warn]: EnumUInt ${this.getClass.getName} getValidVec exclude set got illegal name '${name}'.")
+    }
+    val thisVec = (this.names zip this.values).filter { case (name, _) =>
+      !exclude.contains(name)
+    }.map { case (name, v) =>
+      s"${thisPrefix}${name}" -> (v === value)
+    }
+    if (thatSeq.isEmpty)
+      thisVec
+    else
+      thatSeq.flatMap { case (thatName, thatValid) =>
+        thisVec.map { case (thisName, thisValid) =>
+          s"${thatName}_${thisName}" -> (thatValid && thisValid)
+        }
+      }
+  }
 
   // call validate() in the constructor
   validate()

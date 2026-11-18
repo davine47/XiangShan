@@ -24,10 +24,10 @@ import freechips.rocketchip.util._
 import utility.MaskedRegMap.WritableMask
 import utils._
 import utility._
-import xiangshan.ExceptionNO._
 import xiangshan._
 import xiangshan.backend.fu.util._
 import xiangshan.cache._
+import xiangshan.backend.BackendParams
 import xiangshan.backend.Bundles.{ExceptionInfo, TrapInstInfo}
 import xiangshan.backend.fu.NewCSR.CSREvents.TargetPCBundle
 import xiangshan.backend.fu.NewCSR.CSRNamedConstant.ContextStatus
@@ -35,12 +35,13 @@ import xiangshan.backend.rob.RobPtr
 import utils.MathUtils.{BigIntGenMask, BigIntNot}
 import xiangshan.backend.trace._
 import freechips.rocketchip.rocket.CSRs
-import xiangshan.backend.fu.vector.Bundles.Vstart
+import system.HasSoCParameter
+import xiangshan.backend.fu.vector.Bundles.{Vl, Vstart}
 
 class FpuCsrIO extends Bundle {
-  val fflags = Output(Valid(UInt(5.W)))
+  val fflags = Output(Vec(5, Bool()))
   val isIllegal = Output(Bool())
-  val dirty_fs = Output(Bool())
+  val dirtyFs = Output(Bool())
   val frm = Input(UInt(3.W))
 }
 
@@ -48,13 +49,13 @@ class VpuCsrIO(implicit p: Parameters) extends XSBundle {
   val vstart = Input(Vstart())
   val vxrm = Input(UInt(2.W))
 
-  val vl = Output(UInt(XLEN.W))
+  val diffVl = Option.when(backendParams.basicDebugEn)(Output(Vl()))
 
-  val set_vstart = Output(Valid(UInt(XLEN.W)))
-  val set_vtype = Output(Valid(UInt(XLEN.W)))
-  val set_vxsat = Output(Valid(UInt(1.W)))
+  val setVstart = Output(Valid(UInt(XLEN.W)))
+  val setVtype = Output(Valid(UInt(XLEN.W)))
+  val setVxsat = Output(Bool())
 
-  val dirty_vs = Output(Bool())
+  val dirtyVs = Output(Bool())
 }
 
 
@@ -64,13 +65,6 @@ class PerfCounterIO(implicit p: Parameters) extends XSBundle {
   val perfEventsLsu       = Vec(numCSRPCntLsu, new PerfEvent)
   val perfEventsHc        = Vec(numPCntHc * coreParams.L2NBanks + 1, new PerfEvent)
   val retiredInstr = UInt(7.W)
-  val frontendInfo = new Bundle {
-    val ibufFull  = Bool()
-    val bpuInfo = new Bundle {
-      val bpRight = UInt(XLEN.W)
-      val bpWrong = UInt(XLEN.W)
-    }
-  }
   val ctrlInfo = new Bundle {
     val robFull   = Bool()
     val intdqFull = Bool()
@@ -84,7 +78,7 @@ class PerfCounterIO(implicit p: Parameters) extends XSBundle {
   }
 }
 
-class CSRFileIO(implicit p: Parameters) extends XSBundle {
+class CSRFileIO(implicit p: Parameters) extends XSBundle with HasSoCParameter {
   val hartId = Input(UInt(hartIdLen.W))
   // output (for func === CSROpType.jmp)
   val perf = Input(new PerfCounterIO)
@@ -97,11 +91,13 @@ class CSRFileIO(implicit p: Parameters) extends XSBundle {
   // from rob
   val exception = Flipped(ValidIO(new ExceptionInfo))
   val robDeqPtr = Input(new RobPtr)
+  // Observation-only handshake: publish a latter trap after the former retires.
+  val diffCommitForTrap = Option.when(env.EnableDifftest || env.AlwaysBasicDiff)(Input(Bool()))
+  val diffArchEvent = Option.when(env.EnableDifftest || env.AlwaysBasicDiff)(Output(Valid(Bool())))
   // to ROB
-  val isXRet = Output(Bool())
   val trapTarget = Output(new TargetPCBundle)
   val interrupt = Output(Bool())
-  val wfi_event = Output(Bool())
+  val wfiEvent = Output(Bool())
   //trace
   val traceCSR = Output(new TraceCSR)
   // from LSQ
@@ -121,6 +117,7 @@ class CSRFileIO(implicit p: Parameters) extends XSBundle {
   val instrAddrTransType = Output(new AddrTransType)
   // ack for axireg from imsic. which indicates imsic can work actively
   val msiAck = Output(Bool())
+  val teemsiAck = Option.when(soc.IMSICParams.HasTEEIMSIC)(Output(Bool()))
 }
 
 class VtypeStruct(implicit p: Parameters) extends XSBundle {
@@ -460,7 +457,7 @@ class CSR(cfg: FuConfig)(implicit p: Parameters) extends FuncUnit(cfg)
   val sieMask = "h222".U & mideleg
   val sipMask = "h222".U & mideleg
   val sipWMask = "h2".U(XLEN.W) // ssip is writeable in smode
-  val satp = if(EnbaleTlbDebug) RegInit(UInt(XLEN.W), "h8000000000087fbe".U) else RegInit(0.U(XLEN.W))
+  val satp = if(EnableTlbDebug) RegInit(UInt(XLEN.W), "h8000000000087fbe".U) else RegInit(0.U(XLEN.W))
   // val satp = RegInit(UInt(XLEN.W), "h8000000000087fbe".U) // only use for tlb naive debug
   // val satpMask = "h80000fffffffffff".U(XLEN.W) // disable asid, mode can only be 8 / 0
   // TODO: use config to control the length of asid
@@ -577,9 +574,10 @@ class CSR(cfg: FuConfig)(implicit p: Parameters) extends FuncUnit(cfg)
   println("  Enable unaligned store: " + EnableHardwareStoreMisalign)
   println("  Enable unaligned load: " + EnableHardwareLoadMisalign)
 
-  val srnctl = RegInit(UInt(XLEN.W), "h7".U)
+  val srnctl = RegInit(UInt(XLEN.W), "h17".U)
   csrio.customCtrl.fusion_enable := srnctl(0)
   csrio.customCtrl.wfi_enable := srnctl(2)
+  csrio.customCtrl.high_density_rob_compression_enable := srnctl(4)
 
   // Hypervisor CSRs
   val hstatusWMask = "h7003c0".U(XLEN.W)
@@ -1025,11 +1023,13 @@ class CSR(cfg: FuConfig)(implicit p: Parameters) extends FuncUnit(cfg)
   csrio.customCtrl.distribute_csr.w.bits.data := wdata
   csrio.customCtrl.distribute_csr.w.bits.addr := addr
 
-  when (RegNext(csrio.fpu.fflags.valid)) {
-    fcsr := fflags_wfn(update = true)(RegEnable(csrio.fpu.fflags.bits, csrio.fpu.fflags.valid))
+  val robFflags = RegNext(csrio.fpu.fflags.asUInt, 0.U)
+  when (robFflags.orR) {
+    fcsr := fflags_wfn(update = true)(robFflags)
   }
-  when(RegNext(csrio.vpu.set_vxsat.valid)) {
-    vcsr := vxsat_wfn(update = true)(RegEnable(csrio.vpu.set_vxsat.bits, csrio.vpu.set_vxsat.valid))
+  val robVxsat = RegNext(csrio.vpu.set_vxsat, false.B)
+  when(robVxsat) {
+    vcsr := vxsat_wfn(update = true)(robVxsat)
   }
 
   // set fs and sd in mstatus
@@ -1136,6 +1136,7 @@ class CSR(cfg: FuConfig)(implicit p: Parameters) extends FuncUnit(cfg)
   tlbBundle.priv.vsum := vsstatusStruct.sum.asBool
   tlbBundle.priv.spvp := hstatusStruct.spvp
   tlbBundle.priv.virt  := Mux(mstatusStruct.mprv.asBool, mstatusStruct.mpv & (mstatusStruct.mpp =/= ModeM), virtMode)
+  tlbBundle.priv.fenceVirt := virtMode
   tlbBundle.priv.imode := privilegeMode
   tlbBundle.priv.dmode := Mux((debugMode && dcsr.asTypeOf(new DcsrStruct).mprven || !debugMode) && mstatusStruct.mprv.asBool, mstatusStruct.mpp, privilegeMode)
 
@@ -1569,7 +1570,7 @@ class CSR(cfg: FuConfig)(implicit p: Parameters) extends FuncUnit(cfg)
     difftest.interrupt   := Mux(hasIntr, causeNO, 0.U)
     difftest.exception   := Mux(hasException, causeNO, 0.U)
     difftest.exceptionPC := dexceptionPC
-    if (env.EnableDifftest) {
+    if (env.EnableDifftest || env.FullBasicDiff) {
       difftest.exceptionInst := csrio.exception.bits.instr
     }
   }

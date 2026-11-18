@@ -17,17 +17,15 @@ package xiangshan.frontend.icache
 
 import chisel3._
 import chisel3.util._
-import coupledL2.MemBackTypeMM
 import freechips.rocketchip.tilelink.TLEdgeOut
-import huancun.AliasKey
 import org.chipsalliance.cde.config.Parameters
-import utility.BoolStopWatch
 import utility.MemReqSource
 import utility.ReqSourceKey
-import utility.XSPerfHistogram
 import xiangshan.WfiReqBundle
+import xscache.common.AliasKey
+import xscache.coupledL2.MemBackTypeMM
 
-class ICacheMshr(edge: TLEdgeOut, isFetch: Boolean, ID: Int)(implicit p: Parameters) extends ICacheModule {
+class ICacheMshr(edge: TLEdgeOut, val id: Int)(implicit p: Parameters) extends ICacheModule {
   class ICacheMshrIO(edge: TLEdgeOut)(implicit p: Parameters) extends ICacheBundle {
     val fencei: Bool         = Input(Bool())
     val flush:  Bool         = Input(Bool())
@@ -47,21 +45,28 @@ class ICacheMshr(edge: TLEdgeOut, isFetch: Boolean, ID: Int)(implicit p: Paramet
     // offer the information needed by responding to requester
     val info: Valid[MshrInfoBundle] = ValidIO(new MshrInfoBundle)
     // after respond to requester, invalid the MSHR
-    val invalid: Bool = Input(Bool())
+    val finish: Bool = Input(Bool())
+
+    val perf_latency: UInt = Output(UInt(16.W)) // magic number: latency should less than 65536 cycles
   }
 
   val io: ICacheMshrIO = IO(new ICacheMshrIO(edge))
 
-  private val valid = RegInit(Bool(), false.B)
-  // this MSHR doesn't respond to fetch and sram
-  private val flush  = RegInit(Bool(), false.B)
-  private val fencei = RegInit(Bool(), false.B)
-  // this MSHR has been issued
-  private val issue = RegInit(Bool(), false.B)
+  def isFetch: Boolean = id < NumFetchMshr
 
-  private val blkPAddr = RegInit(UInt((PAddrBits - blockOffBits).W), 0.U)
-  private val vSetIdx  = RegInit(UInt(idxBits.W), 0.U)
-  private val way      = RegInit(UInt(wayBits.W), 0.U)
+  private val valid = RegInit(false.B)
+  // this MSHR doesn't respond to fetch and sram
+  private val flush  = RegInit(false.B)
+  private val fencei = RegInit(false.B)
+  // this MSHR has been issued
+  private val issue = RegInit(false.B)
+
+  // perf: start counting when acquire.fire, stop counting when invalid
+  private val perf_latency = RegInit(0.U(16.W)) // magic number: latency should less than 65536 cycles
+
+  private val blkPAddr = RegInit(0.U((PAddrBits - blockOffBits).W))
+  private val vSetIdx  = RegInit(0.U(idxBits.W))
+  private val way      = RegInit(0.U(wayBits.W))
   // resolve aliasing, refer to comments on AliasTagBits in trait HasICacheParameters
   // vSetIdx is vAddr(untagBits, blockOffBits), aliasTag should be vAddr(untagBits, pgIdxBits)
   // and, AliasTagBits = untagBits - pgIdxBits, so we actually need AliasTagBits-most-significant bits of vSetIdx
@@ -103,7 +108,7 @@ class ICacheMshr(edge: TLEdgeOut, isFetch: Boolean, ID: Int)(implicit p: Paramet
   // send request to L2
   io.acquire.valid := valid && !issue && !io.flush && !io.fencei && !io.wfi.wfiReq
   private val getBlock = edge.Get(
-    fromSource = ID.U,
+    fromSource = id.U,
     toAddress = Cat(blkPAddr, 0.U(blockOffBits.W)),
     lgSize = log2Up(blockBytes).U
   )._2
@@ -117,10 +122,16 @@ class ICacheMshr(edge: TLEdgeOut, isFetch: Boolean, ID: Int)(implicit p: Paramet
   when(io.acquire.fire) {
     issue := true.B
     way   := io.victimWay
+
+    perf_latency := 0.U
+  }
+
+  when(valid && issue) {
+    perf_latency := perf_latency + 1.U
   }
 
   // invalid request when grant finish
-  when(io.invalid) {
+  when(io.finish) {
     valid := false.B
   }
 
@@ -133,12 +144,5 @@ class ICacheMshr(edge: TLEdgeOut, isFetch: Boolean, ID: Int)(implicit p: Paramet
   // we are safe to enter wfi if we have no pending response from L2
   io.wfi.wfiSafe := !(valid && issue)
 
-  XSPerfHistogram(
-    "responseLatency",
-    BoolStopWatch(io.acquire.fire, io.invalid),
-    io.invalid,
-    0,
-    200,
-    10
-  )
+  io.perf_latency := perf_latency
 }

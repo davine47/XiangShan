@@ -18,21 +18,64 @@ package xiangshan.frontend.bpu.tage
 import chisel3._
 import chisel3.util._
 import org.chipsalliance.cde.config.Parameters
-import xiangshan.frontend.PrunedAddr
+import xiangshan.XSCoreParamsKey
+import xiangshan.frontend.Pc
+import xiangshan.frontend.bpu.Prediction
 import xiangshan.frontend.bpu.SaturateCounter
+import xiangshan.frontend.bpu.SaturateCounterFactory
+import xiangshan.frontend.bpu.SaturateCounterInit
 import xiangshan.frontend.bpu.TageTableInfo
 import xiangshan.frontend.bpu.WriteReqBundle
+import xiangshan.frontend.bpu.history.phr.PhrAllFoldedHistories
+
+object TakenCounter extends SaturateCounterFactory {
+  def width(implicit p: Parameters): Int =
+    p(XSCoreParamsKey).frontendParameters.bpuParameters.tageParameters.TakenCtrWidth
+}
+
+object UsefulCounter extends SaturateCounterFactory {
+  def width(implicit p: Parameters): Int =
+    p(XSCoreParamsKey).frontendParameters.bpuParameters.tageParameters.UsefulCtrWidth
+
+  def Init(implicit p: Parameters): SaturateCounter =
+    SaturateCounterInit(width, p(XSCoreParamsKey).frontendParameters.bpuParameters.tageParameters.UsefulCtrInitValue)
+}
+
+object UsefulResetCounter extends SaturateCounterFactory {
+  def width(implicit p: Parameters): Int =
+    p(XSCoreParamsKey).frontendParameters.bpuParameters.tageParameters.UsefulResetCtrWidth
+}
+
+object UseAltOnNaCounter extends SaturateCounterFactory {
+  def width(implicit p: Parameters): Int =
+    p(XSCoreParamsKey).frontendParameters.bpuParameters.tageParameters.UseAltOnNaWidth
+}
 
 class TageEntry(implicit p: Parameters) extends TageBundle {
   val valid:    Bool            = Bool()
   val tag:      UInt            = UInt(TagWidth.W)
-  val takenCtr: SaturateCounter = new SaturateCounter(TakenCtrWidth)
+  val takenCtr: SaturateCounter = TakenCounter()
 }
 
-class BaseTableSramWriteReq(implicit p: Parameters) extends TageBundle {
-  val setIdx:    UInt                 = UInt(BaseTableSetIdxWidth.W)
-  val wayMask:   UInt                 = UInt(FetchBlockAlignInstNum.W)
-  val takenCtrs: Vec[SaturateCounter] = Vec(FetchBlockAlignInstNum, new SaturateCounter(BaseTableTakenCtrWidth))
+class TagePrediction(implicit p: Parameters) extends TageBundle {
+  val takenVec: Vec[Valid[Bool]] = Vec(NumBtbResultEntries, Valid(Bool()))
+  // Fast s2 path: raw provider result, without alt/base selection.
+  val fastTakenVec: Vec[Valid[Bool]] = Vec(NumBtbResultEntries, Valid(Bool()))
+}
+
+class PhrToTageIO(implicit p: Parameters) extends TageBundle {
+  val foldedPathHist:         PhrAllFoldedHistories = Input(new PhrAllFoldedHistories(AllFoldedHistoryInfo))
+  val foldedPathHistForTrain: PhrAllFoldedHistories = Input(new PhrAllFoldedHistories(AllFoldedHistoryInfo))
+}
+
+class MainBtbToTageIO(implicit p: Parameters) extends TageBundle {
+  val result:       Vec[Valid[Prediction]] = Input(Vec(NumBtbResultEntries, Valid(new Prediction)))
+  val s1_positions: Vec[UInt]              = Input(Vec(NumBtbResultEntries, UInt(CfiPositionWidth.W)))
+  val baseConf:     Vec[Bool]              = Input(Vec(NumBtbResultEntries, Bool()))
+}
+
+class TageToScIO(implicit p: Parameters) extends TageBundle {
+  val providerTakenCtrVec: Vec[Valid[SaturateCounter]] = Output(Vec(NumBtbResultEntries, Valid(TakenCounter())))
 }
 
 class TableReadReq(implicit p: Parameters, info: TageTableInfo) extends TageBundle {
@@ -42,91 +85,140 @@ class TableReadReq(implicit p: Parameters, info: TageTableInfo) extends TageBund
 
 class TableReadResp(implicit p: Parameters, info: TageTableInfo) extends TageBundle {
   val entries:    Vec[TageEntry]       = Vec(NumWays, new TageEntry)
-  val usefulCtrs: Vec[SaturateCounter] = Vec(NumWays, new SaturateCounter(UsefulCtrWidth))
+  val usefulCtrs: Vec[SaturateCounter] = Vec(NumWays, UsefulCounter())
 }
 
-class EntrySramWriteReq(implicit p: Parameters, info: TageTableInfo) extends WriteReqBundle
-    with HasTageParameters {
-  val setIdx:         UInt                    = UInt(SetIdxWidth.W)
-  val entry:          TageEntry               = new TageEntry
-  val usefulCtr:      SaturateCounter         = new SaturateCounter(UsefulCtrWidth)
-  override def tag:   Option[UInt]            = Some(entry.tag)
-  override def cnt:   Option[SaturateCounter] = Some(entry.takenCtr)
-  override def taken: Option[Bool]            = Some(entry.takenCtr.isPositive) // FIXME: use actualTaken
+class EntrySramWriteReq(implicit p: Parameters, info: TageTableInfo) extends WriteReqBundle with HasTageParameters {
+  val setIdx:       UInt                    = UInt(SetIdxWidth.W)
+  val entry:        TageEntry               = new TageEntry
+  override def tag: Option[UInt]            = Some(entry.tag)
+  override def cnt: Option[SaturateCounter] = Some(entry.takenCtr)
+}
+
+class UsefulCtrSramWriteReq(implicit p: Parameters, info: TageTableInfo) extends TageBundle {
+  val setIdx:    UInt            = UInt(SetIdxWidth.W)
+  val usefulCtr: SaturateCounter = UsefulCounter()
 }
 
 class TableWriteReq(implicit p: Parameters, info: TageTableInfo) extends TageBundle {
-  val setIdx:     UInt                 = UInt(SetIdxWidth.W)
-  val bankMask:   UInt                 = UInt(NumBanks.W)
-  val wayMask:    UInt                 = UInt(NumWays.W)
-  val entries:    Vec[TageEntry]       = Vec(NumWays, new TageEntry)
-  val usefulCtrs: Vec[SaturateCounter] = Vec(NumWays, new SaturateCounter(UsefulCtrWidth))
+  val setIdx:          UInt                 = UInt(SetIdxWidth.W)
+  val bankMask:        UInt                 = UInt(NumBanks.W)
+  val wayMask:         UInt                 = UInt(NumWays.W)
+  val writeEntryEn:    Vec[Bool]            = Vec(NumWays, Bool())
+  val writeUsefulEn:   Vec[Bool]            = Vec(NumWays, Bool())
+  val actualTakenMask: Vec[Bool]            = Vec(NumWays, Bool())
+  val entries:         Vec[TageEntry]       = Vec(NumWays, new TageEntry)
+  val usefulCtrs:      Vec[SaturateCounter] = Vec(NumWays, UsefulCounter())
+}
+
+class TageMetaEntry(implicit p: Parameters) extends TageBundle {
+  val useProvider:       Bool            = Bool()
+  val hasProvider:       Bool            = Bool()
+  val hasAlt:            Bool            = Bool()
+  val providerTableIdx:  UInt            = UInt(TableIdxWidth.W)
+  val providerWayIdx:    UInt            = UInt(MaxWayIdxWidth.W)
+  val providerTakenCtr:  SaturateCounter = TakenCounter()
+  val providerUsefulCtr: SaturateCounter = UsefulCounter()
+  val altTableIdx:       UInt            = UInt(TableIdxWidth.W)
+  val altWayIdx:         UInt            = UInt(MaxWayIdxWidth.W)
+  val altTakenCtr:       SaturateCounter = TakenCounter()
 }
 
 class TageMeta(implicit p: Parameters) extends TageBundle {
-  val baseTableCtrs: Vec[SaturateCounter] = Vec(FetchBlockInstNum, new SaturateCounter(BaseTableTakenCtrWidth))
-  val debug_setIdx:  Vec[UInt]            = Vec(NumTables, UInt(8.W))        // TODO: remove it
-  val debug_tempTag: Vec[UInt]            = Vec(NumTables, UInt(TagWidth.W)) // TODO: remove it
+  val entries: Vec[TageMetaEntry] = Vec(NumBtbResultEntries, new TageMetaEntry)
 }
 
 class TageFoldedHist(implicit p: Parameters, info: TageTableInfo) extends TageBundle {
-  val forIdx: UInt = UInt(NumSets.W)
-  val forTag: UInt = UInt(TagWidth.W)
+  val forBankIdx: UInt      = UInt(BankIdxWidth.W)
+  val forSetIdx:  UInt      = UInt(SetIdxWidth.W)
+  val forTag:     Vec[UInt] = Vec(2, UInt(TagWidth.W))
 }
 
-class TagMatchResult(implicit p: Parameters) extends TageBundle {
+class PredictTagMatchResult(implicit p: Parameters) extends TageBundle {
   val hit:          Bool            = Bool()
   val hitWayMaskOH: UInt            = UInt(MaxNumWays.W)
-  val entry:        TageEntry       = new TageEntry
-  val usefulCtr:    SaturateCounter = new SaturateCounter(UsefulCtrWidth)
+  val takenCtr:     SaturateCounter = TakenCounter()
+  val usefulCtr:    SaturateCounter = UsefulCounter()
+  // perf analysis only
+  val hitWayMask: UInt = UInt(MaxNumWays.W)
 }
 
-class UpdateInfo(implicit p: Parameters) extends TageBundle {
+class TrainTagMatchResult(implicit p: Parameters) extends TageBundle {
+  val hit:          Bool            = Bool()
+  val hitWayMaskOH: UInt            = UInt(MaxNumWays.W)
+  val tag:          UInt            = UInt(TagWidth.W)
+  val takenCtr:     SaturateCounter = TakenCounter()
+  val usefulCtr:    SaturateCounter = UsefulCounter()
+}
+
+class TrainInfo(implicit p: Parameters) extends TageBundle {
+  val valid: Bool = Bool()
+
+  val hasProvider:          Bool            = Bool()
+  val useProvider:          Bool            = Bool()
   val providerTableOH:      UInt            = UInt(NumTables.W)
   val providerWayOH:        UInt            = UInt(MaxNumWays.W)
   val providerEntry:        TageEntry       = new TageEntry
-  val providerOldUsefulCtr: SaturateCounter = new SaturateCounter(UsefulCtrWidth)
-  val providerNewUsefulCtr: SaturateCounter = new SaturateCounter(UsefulCtrWidth)
+  val providerOldUsefulCtr: SaturateCounter = UsefulCounter()
+  val providerNewUsefulCtr: SaturateCounter = UsefulCounter()
 
+  val hasAlt:          Bool            = Bool()
+  val useAlt:          Bool            = Bool()
   val altTableOH:      UInt            = UInt(NumTables.W)
   val altWayOH:        UInt            = UInt(MaxNumWays.W)
   val altEntry:        TageEntry       = new TageEntry
-  val altOldUsefulCtr: SaturateCounter = new SaturateCounter(UsefulCtrWidth)
+  val altOldUsefulCtr: SaturateCounter = UsefulCounter()
 
-  val useAlt:    Bool = Bool()
-  val finalPred: Bool = Bool()
+  val needAllocate:             Bool = Bool()
+  val needUpdateProviderCtr:    Bool = Bool()
+  val needUpdateProviderUseful: Bool = Bool()
+  val needUpdateAltCtr:         Bool = Bool()
 
-  val increaseUseAlt: Bool = Bool()
-  val decreaseUseAlt: Bool = Bool()
+  val incUseAltOnNa: Bool = Bool()
+  val decUseAltOnNa: Bool = Bool()
+  val useAltOnNaIdx: UInt = UInt(UseAltOnNaIdxWidth.W)
 
-  val needAllocate: Bool = Bool()
+  val finalPred:   Bool = Bool()
+  val actualTaken: Bool = Bool() // used for writeBuffer
+
+  // perf analysis only
+  val hitTableMask:     UInt = UInt(NumTables.W) // all the hit tables
+  val mispredicted:     Bool = Bool()
+  val newestMispredict: Bool = Bool()
 }
 
 class ConditionalBranchTrace(implicit p: Parameters) extends TageBundle {
-  val startVAddr:  PrunedAddr = PrunedAddr(VAddrBits)
-  val branchVAddr: PrunedAddr = PrunedAddr(VAddrBits)
+  val isCond:  Bool = Bool()
+  val mbtbHit: Bool = Bool()
+  val useMeta: Bool = Bool()
+
+  val startPc: Pc   = Pc()
+  val cfiPc:   UInt = UInt(VAddrBits.W)
 
   val hasProvider:       Bool            = Bool()
+  val useProvider:       Bool            = Bool()
   val providerTableIdx:  UInt            = UInt(TableIdxWidth.W)
-  val providerSetIdx:    UInt            = UInt(16.W)
+  val providerSetIdx:    UInt            = UInt(MaxSetIdxWidth.W)
   val providerWayIdx:    UInt            = UInt(MaxWayIdxWidth.W)
-  val providerTakenCtr:  SaturateCounter = new SaturateCounter(TakenCtrWidth)
-  val providerUsefulCtr: SaturateCounter = new SaturateCounter(UsefulCtrWidth)
+  val providerTakenCtr:  SaturateCounter = TakenCounter()
+  val providerUsefulCtr: SaturateCounter = UsefulCounter()
 
   val hasAlt:       Bool            = Bool()
+  val useAlt:       Bool            = Bool()
   val altTableIdx:  UInt            = UInt(TableIdxWidth.W)
-  val altSetIdx:    UInt            = UInt(16.W)
+  val altSetIdx:    UInt            = UInt(MaxSetIdxWidth.W)
   val altWayIdx:    UInt            = UInt(MaxWayIdxWidth.W)
-  val altTakenCtr:  SaturateCounter = new SaturateCounter(TakenCtrWidth)
-  val altUsefulCtr: SaturateCounter = new SaturateCounter(UsefulCtrWidth)
+  val altTakenCtr:  SaturateCounter = TakenCounter()
+  val altUsefulCtr: SaturateCounter = UsefulCounter()
 
-  val baseTableCtr: SaturateCounter = new SaturateCounter(BaseTableTakenCtrWidth)
+  val finalPred:   Bool = Bool()
+  val actualTaken: Bool = Bool()
+  val mispredict:  Bool = Bool()
 
-  val useAlt:         Bool = Bool()
-  val finalPred:      Bool = Bool()
-  val actualTaken:    Bool = Bool()
-  val allocSuccess:   Bool = Bool()
-  val allocTableIdx:  UInt = UInt(TableIdxWidth.W)
-  val allocateSetIdx: UInt = UInt(16.W)
-  val allocWayIdx:    UInt = UInt(MaxWayIdxWidth.W)
+  val needAllocate:     Bool = Bool()
+  val allocateSuccess:  Bool = Bool()
+  val allocateFailure:  Bool = Bool()
+  val allocateTableIdx: UInt = UInt(TableIdxWidth.W)
+  val allocateSetIdx:   UInt = UInt(MaxSetIdxWidth.W)
+  val allocateWayIdx:   UInt = UInt(MaxWayIdxWidth.W)
 }

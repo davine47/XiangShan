@@ -36,14 +36,14 @@ case class ICacheParameters(
     // missUnit
     NumFetchMshr:    Int = 4,
     NumPrefetchMshr: Int = 10,
-    // wayLookup
-    WayLookupSize: Int = 32,
     // ecc
     // NOTE: we call it "ecc" since it can be configured to use ecc like "secded", but by default it is parity
     // TODO: support disabling ecc completely (currently "none" will use "identity", we want to remove entire ecc logic)
     MetaEcc:     String = "parity",  // "none", "identity", "parity", "sec", "secded"
     DataEcc:     String = "parity",  // "none", "identity", "parity", "sec", "secded"
     DataEccUnit: Option[Int] = None, // if None, use blockBytes
+    // try to error-recover automatically by re-fetch data from L2-cache
+    EnableCorruptRefetch: Boolean = false, // disabled due to timing issue (dataArray -> parity check -> response valid)
     // meta array
     // by default, odd and even meta entries are stored in different banks to allow concurrent access
     NumInterleavedBank: Int = 2,
@@ -59,7 +59,9 @@ case class ICacheParameters(
     ctrlUnitParameters: ICacheCtrlUnitParameters = ICacheCtrlUnitParameters(),
     /* *** testing *** */
     ForceMetaEccFail: Boolean = false,
-    ForceDataEccFail: Boolean = false
+    ForceDataEccFail: Boolean = false,
+    // icache trace based on ChiselDB
+    EnableTrace: Boolean = false
 ) extends L1CacheParameters {
   // this is used to prevent magic number in the code, DO NOT CHANGE, it won't work other than 2
   // explanation: we allow concurrent access to consecutive cachelines
@@ -112,16 +114,14 @@ trait HasICacheParameters extends HasFrontendParameters // scalastyle:ignore num
   // missUnit
   def NumFetchMshr:    Int = icacheParameters.NumFetchMshr
   def NumPrefetchMshr: Int = icacheParameters.NumPrefetchMshr
-
-  // wayLookup
-  def WayLookupSize: Int = icacheParameters.WayLookupSize
+  def NumAllMshr:      Int = NumFetchMshr + NumPrefetchMshr
 
   // metaArray w/ parity
   def MetaEcc:       String = icacheParameters.MetaEcc
   def MetaCode:      Code   = Code.fromString(MetaEcc)
   def MetaBits:      Int    = (new ICacheMetadata).getWidth
-  def MetaEntryBits: Int    = MetaCode.width(MetaBits)
-  def MetaEccBits:   Int    = MetaEntryBits - MetaBits
+  def MetaSramWidth: Int    = MetaCode.width(MetaBits)
+  def MetaEccBits:   Int    = MetaSramWidth - MetaBits
 
   def NumInterleavedBank:     Int = icacheParameters.NumInterleavedBank
   def NumInterleavedSet:      Int = nSets / NumInterleavedBank
@@ -143,12 +143,17 @@ trait HasICacheParameters extends HasFrontendParameters // scalastyle:ignore num
   def DataEccBits:           Int = DataEccSegments * DataEccBitsPerSegment
   def DataSramWidth:         Int = ICacheDataBits + DataEccBits + DataPaddingBits
 
+  // mainPipe
+  def EnableCorruptRefetch:  Boolean = icacheParameters.EnableCorruptRefetch
+  def MaybeRvcFineShiftBits: Int     = 2
+
   // submodule enable
   def EnableCtrlUnit: Boolean = icacheParameters.EnableCtrlUnit
 
   // testing
   def ForceMetaEccFail: Boolean = icacheParameters.ForceMetaEccFail
   def ForceDataEccFail: Boolean = icacheParameters.ForceDataEccFail
+  def EnableTrace:      Boolean = icacheParameters.EnableTrace
 }
 
 // For users: these are default ICache parameters set by dev, do not change them here,

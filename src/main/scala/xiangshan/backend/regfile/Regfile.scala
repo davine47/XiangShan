@@ -23,21 +23,27 @@ import utils.OptionWrapper
 import xiangshan._
 import xiangshan.backend.datapath.DataConfig._
 import xiangshan.backend.exu.ExeUnitParams
+import xiangshan.backend.rob.RobPtr
 
 class RfReadPort(dataWidth: Int, addrWidth: Int) extends Bundle {
   val addr = Input(UInt(addrWidth.W))
   val data = Output(UInt(dataWidth.W))
 }
 
+class RfReadPortBank(dataWidth: Int, addrWidth: Int, numBank: Int) extends Bundle {
+  val addr = Input(Vec(numBank, UInt((addrWidth - log2Ceil(numBank)).W)))
+  val data = Output(Vec(numBank, UInt(dataWidth.W)))
+}
 class RfWritePort(dataWidth: Int, addrWidth: Int) extends Bundle {
   val wen = Input(Bool())
   val addr = Input(UInt(addrWidth.W))
   val data = Input(UInt(dataWidth.W))
 }
 
-class RfReadPortWithConfig(val rfReadDataCfg: DataConfig, addrWidth: Int) extends Bundle {
-  val addr: UInt = Input(UInt(addrWidth.W))
-  val srcType: UInt = Input(UInt(3.W))
+class RfReadPortWithConfig(val rfReadDataCfg: DataConfig, addrWidth: Int)(implicit p: Parameters) extends Bundle {
+  val addr    = UInt(addrWidth.W)
+  val robIdx  = new RobPtr
+  val issueValid = Bool()
 
   def readInt: Boolean = IntRegSrcDataSet.contains(rfReadDataCfg)
   def readFp : Boolean = FpRegSrcDataSet .contains(rfReadDataCfg)
@@ -74,6 +80,7 @@ class Regfile
     val readPorts = Vec(numReadPorts, new RfReadPort(len, width))
     val writePorts = Vec(numWritePorts, new RfWritePort(len, width))
     val debug_rports = Vec(65, new RfReadPort(len, width))
+    val debug_all_rdata = Vec(numPregs, UInt(len.W))
   })
   override def desiredName = name
   println(name + ": size:" + numPregs + " read: " + numReadPorts + " write: " + numWritePorts)
@@ -106,6 +113,76 @@ class Regfile
     }
   }
   val writePorts = io.writePorts
+  for (i <- 0 until writePorts.size - 1) {
+    val hasSameWrite = writePorts.drop(i + 1).map(w => w.wen && w.addr === writePorts(i).addr && writePorts(i).wen).reduce(_ || _)
+    assert(!hasSameWrite, "RegFile two or more writePorts write same addr")
+  }
+  for (i <- mem.indices) {
+    if (hasZero && i == 0) {
+      mem_0 := 0.U
+    }
+    else {
+      val wenOH = VecInit(io.writePorts.map(w => w.wen && w.addr === i.U))
+      val wData = Mux1H(wenOH, io.writePorts.map(_.data))
+      when(wenOH.asUInt.orR) {
+        if (i == 0) mem_0 := wData
+        else mem(i) := wData
+      }
+    }
+  }
+
+  for (rport <- io.debug_rports) {
+    rport.data := memForRead(rport.addr)
+  }
+  io.debug_all_rdata.zipWithIndex.foreach { case (rdata, idx) =>
+    if (idx == 0)
+      rdata := mem_0
+    else
+      rdata := mem(idx)
+  }
+}
+
+class RegfileBank
+(
+  name: String,
+  numPregs: Int,
+  numBank: Int,
+  numReadPorts: Int,
+  numWritePorts: Int,
+  hasZero: Boolean,
+  len: Int,
+  width: Int,
+  isVlRegfile: Boolean = false,
+) extends Module {
+  val io = IO(new Bundle() {
+    val readPorts = Vec(numReadPorts, new RfReadPortBank(len, width, numBank))
+    val writePorts = Vec(numWritePorts, new RfWritePort(len, width))
+    val debug_rports = Vec(65, new RfReadPort(len, width))
+    val debug_all_rdata = Vec(numPregs, UInt(len.W))
+  })
+  override def desiredName = name
+  println(name + ": size: " + numPregs + " read: " + numReadPorts + " write: " + numWritePorts + " numBank: " + numBank)
+  require(isPow2(numBank), s"numBank must be a power of two, but got $numBank")
+  require(numPregs >= numBank, s"numPregs ($numPregs) must be no less than numBank ($numBank)")
+  require(width == log2Up(numPregs), s"address width ($width) does not match numPregs ($numPregs)")
+
+  val mem_0 = if (isVlRegfile) RegInit(0.U(len.W)) else Reg(UInt(len.W))
+  val mem = Reg(Vec(numPregs, UInt(len.W)))
+  val memForRead = Wire(Vec(numPregs, UInt(len.W)))
+  memForRead.zipWithIndex.map{ case(m, i) =>
+    if (i == 0) m := mem_0
+    else m := mem(i)
+  }
+  val banks = (0 until numBank).map { bank =>
+    memForRead.zipWithIndex.filter { case (_, index) => index % numBank == bank }.map(_._1)
+  }
+  for (r <- io.readPorts) {
+    for (i <- 0 until numBank) {
+      val thisBank = VecInit(banks(i))
+      r.data(i) := thisBank(RegNext(r.addr(i)))
+    }
+  }
+  val writePorts = io.writePorts
   for (i <- writePorts.indices) {
     if (i < writePorts.size-1) {
       val hasSameWrite = writePorts.drop(i + 1).map(w => w.wen && w.addr === writePorts(i).addr && writePorts(i).wen).reduce(_ || _)
@@ -129,6 +206,12 @@ class Regfile
   for (rport <- io.debug_rports) {
     rport.data := memForRead(rport.addr)
   }
+  io.debug_all_rdata.zipWithIndex.foreach { case (rdata, idx) =>
+    if (idx == 0)
+      rdata := mem_0
+    else
+      rdata := mem(idx)
+  }
 }
 
 object Regfile {
@@ -146,6 +229,7 @@ object Regfile {
     bankNum      : Int = 1,
     debugReadAddr: Option[Seq[UInt]],
     debugReadData: Option[Vec[UInt]],
+    debugAllRData: Option[Vec[UInt]],
     isVlRegfile  : Boolean = false,
   )(implicit p: Parameters): Unit = {
     val numReadPorts = raddr.length
@@ -197,6 +281,82 @@ object Regfile {
         rport.data
       })
     }
+    if (debugAllRData.nonEmpty) {
+      debugAllRData.get := regfile.io.debug_all_rdata
+    }
+  }
+}
+
+object RegfileBank {
+  // non-return version
+  def apply(
+             name         : String,
+             numEntries   : Int,
+             numBank      : Int,
+             raddr        : Seq[Seq[UInt]],
+             rdata        : Vec[Vec[UInt]],
+             wen          : Seq[Bool],
+             waddr        : Seq[UInt],
+             wdata        : Seq[UInt],
+             hasZero      : Boolean,
+             withReset    : Boolean = false,
+             debugReadAddr: Option[Seq[UInt]],
+             debugReadData: Option[Vec[UInt]],
+             debugAllRData: Option[Vec[UInt]],
+             isVlRegfile  : Boolean = false,
+           )(implicit p: Parameters): Unit = {
+    val numReadPorts = raddr.length
+    val numWritePorts = wen.length
+    require(wen.length == waddr.length)
+    require(wen.length == wdata.length)
+    val dataBits = wdata.map(_.getWidth).min
+    require(wdata.map(_.getWidth).min == wdata.map(_.getWidth).max, s"dataBits != $dataBits")
+    val addrBits = waddr.map(_.getWidth).min
+    require(waddr.map(_.getWidth).min == waddr.map(_.getWidth).max, s"addrBits != $addrBits")
+
+    val instanceName = name(0).toLower.toString() + name.drop(1)
+    require(instanceName != name, "Regfile Instance Name can't be same as Module name")
+    val regfile = Module(new RegfileBank(name, numEntries, numBank, numReadPorts, numWritePorts, hasZero, dataBits, addrBits, isVlRegfile)).suggestName(instanceName)
+    rdata := regfile.io.readPorts.zip(raddr).map { case (rport, addr) =>
+      rport.addr := VecInit(addr)
+      rport.data
+    }
+
+    regfile.io.writePorts.zip(wen).zip(waddr).zip(wdata).foreach{ case (((wport, en), addr), data) =>
+      wport.wen := en
+      wport.addr := addr
+      wport.data := data
+    }
+    if (withReset) {
+      val numResetCycles = math.ceil(numEntries / numWritePorts).toInt
+      val resetCounter = RegInit(numResetCycles.U)
+      val resetWaddr = RegInit(VecInit((0 until numWritePorts).map(_.U(log2Up(numEntries + 1).W))))
+      val inReset = resetCounter =/= 0.U
+      when (inReset) {
+        resetCounter := resetCounter - 1.U
+        resetWaddr := VecInit(resetWaddr.map(_ + numWritePorts.U))
+      }
+      when (!inReset) {
+        resetWaddr.map(_ := 0.U)
+      }
+      for ((wport, i) <- regfile.io.writePorts.zipWithIndex) {
+        wport.wen := inReset || wen(i)
+        wport.addr := Mux(inReset, resetWaddr(i), waddr(i))
+        wport.data := wdata(i)
+      }
+    }
+
+    require(debugReadAddr.nonEmpty == debugReadData.nonEmpty, "Both debug addr and data bundles should be empty or not")
+    regfile.io.debug_rports := DontCare
+    if (debugReadAddr.nonEmpty && debugReadData.nonEmpty) {
+      debugReadData.get := VecInit(regfile.io.debug_rports.zip(debugReadAddr.get).map { case (rport, addr) =>
+        rport.addr := addr
+        rport.data
+      })
+    }
+    if (debugAllRData.nonEmpty) {
+      debugAllRData.get := regfile.io.debug_all_rdata
+    }
   }
 }
 
@@ -210,14 +370,15 @@ object IntRegFile {
     wen          : Seq[Bool],
     waddr        : Seq[UInt],
     wdata        : Seq[UInt],
-    debugReadAddr: Option[Seq[UInt]],
-    debugReadData: Option[Vec[UInt]],
+    debugReadAddr: Option[Seq[UInt]] = None,
+    debugReadData: Option[Vec[UInt]] = None,
+    debugAllRData: Option[Vec[UInt]] = None,
     withReset    : Boolean = false,
     bankNum      : Int,
   )(implicit p: Parameters): Unit = {
     Regfile(
       name, numEntries, raddr, rdata, wen, waddr, wdata,
-      hasZero = true, withReset, bankNum, debugReadAddr, debugReadData)
+      hasZero = true, withReset, bankNum, debugReadAddr, debugReadData, debugAllRData)
   }
 }
 
@@ -232,8 +393,9 @@ object IntRegFileSplit {
     wen          : Seq[Bool],
     waddr        : Seq[UInt],
     wdata        : Seq[UInt],
-    debugReadAddr: Option[Seq[UInt]],
-    debugReadData: Option[Vec[UInt]],
+    debugReadAddr: Option[Seq[UInt]] = None,
+    debugReadData: Option[Vec[UInt]] = None,
+    debugAllRData: Option[Vec[UInt]] = None,
     withReset    : Boolean = false,
     bankNum      : Int,
  )(implicit p: Parameters): Unit = {
@@ -248,6 +410,12 @@ object IntRegFileSplit {
         r := Cat((0 until splitNum).map(x => debugReadDataVec.get(x)(i)).reverse)
       }
     }
+    val debugAllRDataVec = OptionWrapper(debugAllRData.nonEmpty, Wire(Vec(splitNum, Vec(debugAllRData.get.length, UInt((debugAllRData.get.head.getWidth / splitNum).W)))))
+    if (debugAllRData.nonEmpty) {
+      debugAllRData.get.zipWithIndex.map { case (r, i) =>
+        r := Cat((0 until splitNum).map(x => debugAllRDataVec.get(x)(i)).reverse)
+      }
+    }
     for (i <- 0 until splitNum){
       val wdataThisPart = wdata.map { case x =>
         val widthThisPart = x.getWidth / splitNum
@@ -256,8 +424,34 @@ object IntRegFileSplit {
       val nameSuffix = if (splitNum > 1) s"Part${i}" else ""
       Regfile(
         name + nameSuffix, numEntries, raddr, rdataVec(i), wen, waddr, wdataThisPart,
-        hasZero = true, withReset, bankNum, debugReadAddr, OptionWrapper(debugReadData.nonEmpty, debugReadDataVec.get(i)))
+        hasZero = true, withReset, bankNum, debugReadAddr, OptionWrapper(debugReadData.nonEmpty, debugReadDataVec.get(i)),
+        OptionWrapper(debugAllRData.nonEmpty, debugAllRDataVec.get(i))
+      )
     }
+  }
+}
+
+object IntRegFileBank {
+  // non-return version
+  def apply(
+             name         : String,
+             numEntries   : Int,
+             numBank      : Int,
+             raddr        : Vec[Vec[UInt]],
+             rdata        : Vec[Vec[UInt]],
+             wen          : Seq[Bool],
+             waddr        : Seq[UInt],
+             wdata        : Seq[UInt],
+             debugReadAddr: Option[Seq[UInt]] = None,
+             debugReadData: Option[Vec[UInt]] = None,
+             debugAllRData: Option[Vec[UInt]] = None,
+             withReset    : Boolean = false,
+           )(implicit p: Parameters): Unit = {
+    require(Seq(1, 2, 4).contains(numBank), "bankNum must be 1 or 2 or 4")
+    RegfileBank(
+      name, numEntries, numBank, raddr, rdata, wen, waddr, wdata,
+      hasZero = true, withReset, debugReadAddr, debugReadData, debugAllRData
+    )
   }
 }
 
@@ -271,15 +465,16 @@ object FpRegFile {
              wen          : Seq[Bool],
              waddr        : Seq[UInt],
              wdata        : Seq[UInt],
-             debugReadAddr: Option[Seq[UInt]],
-             debugReadData: Option[Vec[UInt]],
+             debugReadAddr: Option[Seq[UInt]] = None,
+             debugReadData: Option[Vec[UInt]] = None,
+             debugAllRData: Option[Vec[UInt]] = None,
              withReset    : Boolean = false,
              bankNum      : Int,
              isVlRegfile  : Boolean = false,
            )(implicit p: Parameters): Unit = {
     Regfile(
       name, numEntries, raddr, rdata, wen, waddr, wdata,
-      hasZero = false, withReset, bankNum, debugReadAddr, debugReadData, isVlRegfile)
+      hasZero = false, withReset, bankNum, debugReadAddr, debugReadData, debugAllRData, isVlRegfile)
   }
 }
 
@@ -294,8 +489,9 @@ object FpRegFileSplit {
              wen          : Seq[Bool],
              waddr        : Seq[UInt],
              wdata        : Seq[UInt],
-             debugReadAddr: Option[Seq[UInt]],
-             debugReadData: Option[Vec[UInt]],
+             debugReadAddr: Option[Seq[UInt]] = None,
+             debugReadData: Option[Vec[UInt]] = None,
+             debugAllRData: Option[Vec[UInt]] = None,
              withReset    : Boolean = false,
              bankNum      : Int,
              isVlRegfile  : Boolean = false,
@@ -311,6 +507,12 @@ object FpRegFileSplit {
         r := Cat((0 until splitNum).map(x => debugReadDataVec.get(x)(i)).reverse)
       }
     }
+    val debugAllRDataVec = OptionWrapper(debugAllRData.nonEmpty, Wire(Vec(splitNum, Vec(debugAllRData.get.length, UInt((debugAllRData.get.head.getWidth / splitNum).W)))))
+    if (debugAllRData.nonEmpty) {
+      debugAllRData.get.zipWithIndex.map { case (r, i) =>
+        r := Cat((0 until splitNum).map(x => debugAllRDataVec.get(x)(i)).reverse)
+      }
+    }
     for (i <- 0 until splitNum){
       val wdataThisPart = wdata.map { case x =>
         val widthThisPart = x.getWidth / splitNum
@@ -319,7 +521,8 @@ object FpRegFileSplit {
       val nameSuffix = if (splitNum > 1) s"Part${i}" else ""
       Regfile(
         name + nameSuffix, numEntries, raddr, rdataVec(i), wen, waddr, wdataThisPart,
-        hasZero = false, withReset, bankNum, debugReadAddr, OptionWrapper(debugReadData.nonEmpty, debugReadDataVec.get(i)), isVlRegfile)
+        hasZero = false, withReset, bankNum, debugReadAddr, OptionWrapper(debugReadData.nonEmpty, debugReadDataVec.get(i)),
+        OptionWrapper(debugAllRData.nonEmpty, debugAllRDataVec.get(i)), isVlRegfile)
     }
   }
 }
@@ -335,8 +538,9 @@ object VfRegFile {
     wen          : Seq[Seq[Bool]],
     waddr        : Seq[UInt],
     wdata        : Seq[UInt],
-    debugReadAddr: Option[Seq[UInt]],
-    debugReadData: Option[Vec[UInt]],
+    debugReadAddr: Option[Seq[UInt]] = None,
+    debugReadData: Option[Vec[UInt]] = None,
+    debugAllRData: Option[Vec[UInt]] = None,
     withReset    : Boolean = false,
   )(implicit p: Parameters): Unit = {
     require(splitNum >= 1, "splitNum should be no less than 1")
@@ -344,7 +548,7 @@ object VfRegFile {
     if (splitNum == 1) {
       Regfile(
         name, numEntries, raddr, rdata, wen.head, waddr, wdata,
-        hasZero = false, withReset, bankNum = 1, debugReadAddr, debugReadData)
+        hasZero = false, withReset, bankNum = 1, debugReadAddr, debugReadData, debugAllRData)
     } else {
       val dataWidth = wdata.head.getWidth / splitNum
       val numReadPorts = raddr.length
@@ -352,11 +556,12 @@ object VfRegFile {
       val wdataVec = Wire(Vec(splitNum, Vec(wdata.length, UInt(dataWidth.W))))
       val rdataVec = Wire(Vec(splitNum, Vec(raddr.length, UInt(dataWidth.W))))
       val debugRDataVec: Option[Vec[Vec[UInt]]] = debugReadData.map(x => Wire(Vec(splitNum, Vec(x.length, UInt(dataWidth.W)))))
+      val debugAllRDataVec: Option[Vec[Vec[UInt]]] = debugAllRData.map(x => Wire(Vec(splitNum, Vec(x.length, UInt(dataWidth.W)))))
       for (i <- 0 until splitNum) {
         wdataVec(i) := wdata.map(_ ((i + 1) * dataWidth - 1, i * dataWidth))
         Regfile(
           name + s"Part${i}", numEntries, raddr, rdataVec(i), wen(i), waddr, wdataVec(i),
-          hasZero = false, withReset, bankNum = 1, debugReadAddr, debugRDataVec.map(_(i))
+          hasZero = false, withReset, bankNum = 1, debugReadAddr, debugRDataVec.map(_(i)), debugAllRDataVec.map(_(i))
         )
       }
       for (i <- 0 until rdata.length) {
@@ -365,6 +570,11 @@ object VfRegFile {
       if (debugReadData.nonEmpty) {
         for (i <- 0 until debugReadData.get.length) {
           debugReadData.get(i) := Cat(debugRDataVec.get.map(_ (i)).reverse)
+        }
+      }
+      if (debugAllRData.nonEmpty) {
+        for (i <- 0 until debugAllRData.get.length) {
+          debugAllRData.get(i) := Cat(debugAllRDataVec.get.map(_(i)).reverse)
         }
       }
     }
